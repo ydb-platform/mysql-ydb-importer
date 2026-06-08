@@ -2,6 +2,8 @@
 
 Efficient utility for migrating schema and data from **MySQL to YDB**, designed for **large tables** (data larger than available RAM).
 
+**Goal: a one-to-one copy of the source database.** Table and column names are preserved as in MySQL; data types are mapped to the closest YDB equivalents (`INT` → `Int32`, `VARCHAR` → `Text`, `AUTO_INCREMENT` → `BigSerial`, and so on). The result should be a YDB database that mirrors the original structure and can be queried with minimal mental translation.
+
 Each chunk is read from MySQL in a single bounded `SELECT`, written to YDB via idempotent `BulkUpsert`, then discarded from memory. The process repeats until the table is done — memory usage stays flat regardless of table size.
 
 ## Why a separate project?
@@ -23,34 +25,59 @@ For a **MySQL-only** migration of **multi-gigabyte tables**, a dedicated tool wi
 
 ## MySQL schema fidelity
 
-mysql2ydb reads MySQL metadata from `information_schema` and maps it to native YDB DDL — not via generic JDBC type codes. Several MySQL-specific constructs are preserved in a form that [ydb-importer](https://github.com/ydb-platform/ydb-importer) does not produce:
+Schema migration aims for **structural parity**: same table names, same column names, indexes where YDB allows them, and types chosen to keep values representable without loss (unsigned integers stay unsigned, booleans stay booleans, and so on).
 
-| MySQL feature | mysql2ydb | ydb-importer |
+[YDB Importer](https://github.com/ydb-platform/ydb-importer) solves a different schema problem: it is built to import from many JDBC sources into a **configurable** YDB layout (`table-name-format`, `blob-name-format`, date conversion modes, optional synthetic keys). That flexibility changes the result — it is not a one-to-one mirror of the MySQL catalog.
+
+mysql2ydb reads MySQL metadata from `information_schema` and maps it to native YDB DDL directly. The table below lists schema differences you will see in practice when importing the same MySQL database with both tools:
+
+| MySQL feature | mysql2ydb (one-to-one copy) | ydb-importer |
 |---|---|---|
-| `AUTO_INCREMENT` | `BigSerial` + `ALTER SEQUENCE … START WITH` from `TABLES.AUTO_INCREMENT` — new inserts after migration continue from the same counter | Column becomes plain `Int32`/`Int64`; no `BigSerial`, no sequence reset |
+| **Table names** | Same as in MySQL (`users`, `orders`, …) | Renamed by template, e.g. `mysql1/${schema}/${table}` → `mysql1/mydb/users` ([sample config](https://github.com/ydb-platform/ydb-importer/blob/main/scripts/sample-mysql.xml)) |
+| **Column names** | Preserved as in MySQL | Sanitized: spaces, `.`, `/`, `` ` `` → `_` ([`ColumnInfo.safeYdbColumnName`](https://github.com/ydb-platform/ydb-importer/blob/main/src/main/java/tech/ydb/importer/source/ColumnInfo.java)) |
+| `AUTO_INCREMENT` | `BigSerial` + `ALTER SEQUENCE … START WITH` from `TABLES.AUTO_INCREMENT` | Plain `Int32`/`Int64`; no `BigSerial`, no sequence reset |
 | `INT UNSIGNED`, `BIGINT UNSIGNED`, … | `Uint32` / `Uint64` | JDBC maps integers to signed `Int32`/`Int64` |
-| `TINYINT(1)` | `Bool` | `TINYINT` → `Int32` (driver-dependent; `BOOLEAN` → `Bool`) |
-| Secondary `KEY` / `UNIQUE KEY` | Recreated in `CREATE TABLE` as `INDEX … GLOBAL ASYNC` / `GLOBAL UNIQUE SYNC` | Only `PRIMARY KEY` in DDL; no secondary indexes |
+| `TINYINT(1)` | `Bool` | `TINYINT` → `Int32` (`BOOLEAN` → `Bool`) |
+| `BIT` | `Uint64` | `Bool` (JDBC `Types.BIT`) |
+| Secondary `KEY` / `UNIQUE KEY` | `INDEX … GLOBAL ASYNC` / `GLOBAL UNIQUE SYNC` in `CREATE TABLE` | Only `PRIMARY KEY` in DDL; no secondary indexes |
 | `ENUM`, `SET`, `JSON` | `Text` | `Text` (similar) |
-| `BLOB` / `BINARY` | Inline `String` (bytes) in the main table | Separate supplemental tables per BLOB/CLOB field |
+| `BLOB` / `BINARY` | Same column, inline `String` (bytes) | Column becomes `Int64` (blob id); payload split into a **separate table** `${schema}/${table}_${field}` with rows `(id, pos, val)` in 64 KB blocks ([`BlobReader`](https://github.com/ydb-platform/ydb-importer/blob/main/src/main/java/tech/ydb/importer/target/BlobReader.java)) |
+| `TEXT` / `CLOB` (large text) | Inline `Text` in the main table | Optional separate CLOB table (32K-char blocks) or inline `Text` depending on config |
+| Table **without primary key** | Schema unchanged; data read via `LIMIT/OFFSET` | Extra column `ydb_synth_key Text` added as PK (SHA-256 over row); **duplicate rows collapse** to one ([`SynthKey`](https://github.com/ydb-platform/ydb-importer/blob/main/src/main/java/tech/ydb/importer/target/SynthKey.java)) |
+| `DATE` | `Date` | `Date32` by default (`conv-date=DATE_NEW`) |
+| `DATETIME` / `TIMESTAMP` | `Timestamp` | `Datetime64` / `Timestamp64` by default |
+| `TIME` | `Text` (fallback) | `Int32` (seconds since midnight) |
+| `DECIMAL(p,s)` | `Decimal(22, 9)` for all | `Decimal(p,s)` when `allow-custom-decimal=true` |
 | `YEAR` | `Uint16` | Not covered in MySQL type tests |
+| Partitioning | `AUTO_PARTITIONING_BY_LOAD` only | `PARTITION_AT_KEYS`, source partition splits, column-store `HASH`, etc. |
 
-Implementation: schema mapping in [`internal/ydb/schema.go`](internal/ydb/schema.go) and [`internal/schema/columns.go`](internal/schema/columns.go).
+Implementation: [`internal/ydb/schema.go`](internal/ydb/schema.go), [`internal/schema/columns.go`](internal/schema/columns.go).
 
-**`AUTO_INCREMENT` example** — a MySQL column `id BIGINT AUTO_INCREMENT` becomes:
+### Examples of structural differences
+
+**`AUTO_INCREMENT`** — MySQL `id BIGINT AUTO_INCREMENT` becomes:
 
 ```sql
 `id` BigSerial NOT NULL,
 PRIMARY KEY (`id`)
 ```
 
-After `CREATE TABLE`, if `information_schema.TABLES.AUTO_INCREMENT` is known, the tool runs:
+After `CREATE TABLE`, if `information_schema.TABLES.AUTO_INCREMENT` is known:
 
 ```sql
 ALTER SEQUENCE `<db>/<table>/_serial_column_id` START WITH <next_value> RESTART
 ```
 
-so the YDB sequence matches MySQL's counter after the data load.
+**`BLOB`** — MySQL table `attachments (id INT, data MEDIUMBLOB)`:
+
+| | Main table column `data` | Where bytes live |
+|---|---|---|
+| **mysql2ydb** | `data String` | In the same row |
+| **ydb-importer** | `data Int64` (reference id) | Separate table `…/attachments_data` with chunked rows |
+
+With mysql2ydb you can `SELECT data FROM attachments WHERE id = 1` exactly like in MySQL. With ydb-importer you join the main table to the supplemental blob table (or read by id).
+
+**Tables without PK** — mysql2ydb does not add columns; ydb-importer injects `ydb_synth_key` and changes row cardinality for identical tuples.
 
 **Secondary indexes** — non-unique keys become `GLOBAL ASYNC`, unique keys (except PK) become `GLOBAL UNIQUE SYNC`. Tables with sync unique indexes automatically fall back to transactional `UPSERT` during data load, because `BulkUpsert` supports only async indexes ([`internal/ydb/writer.go`](internal/ydb/writer.go)).
 
@@ -76,7 +103,7 @@ See [docs/DATA_MIGRATION.md](docs/DATA_MIGRATION.md) for architecture details.
 
 ## Features
 
-- **Faithful MySQL schema** — `AUTO_INCREMENT` → `BigSerial` with sequence reset, `UNSIGNED` → `Uint32`/`Uint64`, secondary indexes, `TINYINT(1)` → `Bool` (see above).
+- **One-to-one schema copy** — original table and column names; MySQL types mapped to the closest YDB types (`AUTO_INCREMENT` → `BigSerial`, `UNSIGNED` → `Uint32`/`Uint64`, secondary indexes, `TINYINT(1)` → `Bool`; see above).
 - **Schema creation** — tables in YDB are created from MySQL metadata (`information_schema`).
 - **Chunked data migration** — bounded memory, suitable for tables larger than RAM.
 - **Idempotent writes** — `BulkUpsert` with `table.WithIdempotent()`; re-running does not create duplicates.
