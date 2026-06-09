@@ -43,7 +43,7 @@ mysql2ydb reads MySQL metadata from `information_schema` and maps it to native Y
 | `ENUM`, `SET`, `JSON` | `Text` | `Text` (similar) |
 | `BLOB` / `BINARY` | Same column, inline `String` (bytes) | Column becomes `Int64` (blob id); payload split into a **separate table** `${schema}/${table}_${field}` with rows `(id, pos, val)` in 64 KB blocks ([`BlobReader`](https://github.com/ydb-platform/ydb-importer/blob/main/src/main/java/tech/ydb/importer/target/BlobReader.java)) |
 | `TEXT` / `CLOB` (large text) | Inline `Text` in the main table | Optional separate CLOB table (32K-char blocks) or inline `Text` depending on config |
-| Table **without primary key** | Schema unchanged; data read via `LIMIT/OFFSET` | Extra column `ydb_synth_key Text` added as PK (SHA-256 over row); **duplicate rows collapse** to one ([`SynthKey`](https://github.com/ydb-platform/ydb-importer/blob/main/src/main/java/tech/ydb/importer/target/SynthKey.java)) |
+| Table **without primary key** | **Not supported** — `CREATE TABLE` fails (YDB requires `PRIMARY KEY`); add a PK in MySQL before migration | Extra column `ydb_synth_key Text` added as PK (SHA-256 over row); **duplicate rows collapse** to one ([`SynthKey`](https://github.com/ydb-platform/ydb-importer/blob/main/src/main/java/tech/ydb/importer/target/SynthKey.java)) |
 | `DATE` | `Date` | `Date32` by default (`conv-date=DATE_NEW`) |
 | `DATETIME` / `TIMESTAMP` | `Timestamp` | `Datetime64` / `Timestamp64` by default |
 | `TIME` | `Text` (fallback) | `Int32` (seconds since midnight) |
@@ -77,7 +77,34 @@ ALTER SEQUENCE `<db>/<table>/_serial_column_id` START WITH <next_value> RESTART
 
 With mysql2ydb you can `SELECT data FROM attachments WHERE id = 1` exactly like in MySQL. With ydb-importer you join the main table to the supplemental blob table (or read by id).
 
-**Tables without PK** — mysql2ydb does not add columns; ydb-importer injects `ydb_synth_key` and changes row cardinality for identical tuples.
+#### Tables without a primary key
+
+YDB requires a `PRIMARY KEY` on every table. mysql2ydb takes the key **only** from MySQL columns with `COLUMN_KEY = 'PRI'`; `UNIQUE KEY` indexes become secondary `GLOBAL UNIQUE SYNC` indexes but do **not** become the primary key. If a table has no primary key, schema creation fails (`PRIMARY KEY ()` is invalid DDL) and data migration never starts.
+
+Before migrating such tables, add a primary key in MySQL:
+
+```sql
+ALTER TABLE my_table ADD COLUMN id BIGINT AUTO_INCREMENT PRIMARY KEY FIRST;
+```
+
+Or promote an existing column (or column set) to `PRIMARY KEY` if it is actually unique.
+
+Find tables without a primary key:
+
+```sql
+SELECT t.TABLE_NAME
+FROM information_schema.TABLES t
+WHERE t.TABLE_SCHEMA = DATABASE()
+  AND t.TABLE_TYPE = 'BASE TABLE'
+  AND NOT EXISTS (
+    SELECT 1 FROM information_schema.STATISTICS s
+    WHERE s.TABLE_SCHEMA = t.TABLE_SCHEMA
+      AND s.TABLE_NAME = t.TABLE_NAME
+      AND s.INDEX_NAME = 'PRIMARY'
+  );
+```
+
+If you cannot add a key in MySQL, use [ydb-importer](https://github.com/ydb-platform/ydb-importer) instead — it injects a synthetic `ydb_synth_key` column (SHA-256 over the row). mysql2ydb does not add synthetic keys; note that identical rows collapse to one in ydb-importer, so row cardinality may differ from MySQL.
 
 **Secondary indexes** — non-unique keys become `GLOBAL ASYNC`, unique keys (except PK) become `GLOBAL UNIQUE SYNC`. Tables with sync unique indexes automatically fall back to transactional `UPSERT` during data load, because `BulkUpsert` supports only async indexes ([`internal/ydb/writer.go`](internal/ydb/writer.go)).
 
@@ -188,7 +215,7 @@ Migrate specific tables:
 ## Chunked reading
 
 - For tables with a **primary key**, cursor-based pagination is used: `WHERE (pk > ?) ORDER BY pk LIMIT batch_size`, which gives stable memory usage and acceptable speed on large volumes.
-- For tables without a suitable key, `LIMIT batch_size OFFSET offset` is used (very large offsets may degrade performance).
+- Tables **without a primary key are not supported** — see [Tables without a primary key](#tables-without-a-primary-key) in the schema section above. The reader has a `LIMIT/OFFSET` fallback in code, but schema creation fails before data transfer begins.
 
 ## BulkUpsert idempotency
 
