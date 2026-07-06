@@ -13,11 +13,13 @@ type Config struct {
 	MySQLDSN string
 
 	// YDB
-	YDBEndpoint   string
-	YDBDatabase   string
-	YDBTokenFile  string // path to file with access token (optional)
-	YDBDebug      bool   // enable YDB SDK trace logs (driver, table, query, retry)
-	YDBWarn       bool   // enable YDB SDK logs at WARN level and above only
+	YDBEndpoint    string
+	YDBDatabase    string
+	YDBTokenFile   string // path to file with IAM access token (optional)
+	YDBSAKeyFile   string // path to Yandex Cloud service account authorized key JSON
+	YDBYCMetadata  bool   // use Yandex Cloud metadata service credentials (VM/Cloud Functions)
+	YDBDebug       bool   // enable YDB SDK trace logs (driver, table, query, retry)
+	YDBWarn        bool   // enable YDB SDK logs at WARN level and above only
 
 	// Migration
 	SchemaOnly     bool
@@ -39,7 +41,9 @@ func Parse() (*Config, error) {
 	flag.StringVar(&cfg.YDBEndpoint, "ydb", "", "YDB endpoint (e.g. grpc://localhost:2136)")
 	flag.StringVar(&cfg.YDBEndpoint, "ydb-endpoint", "", "YDB endpoint (alias for -ydb)")
 	flag.StringVar(&cfg.YDBDatabase, "ydb-database", "local", "YDB database path (e.g. /local)")
-	flag.StringVar(&cfg.YDBTokenFile, "ydb-token-file", "", "Path to file with YDB access token (optional)")
+	flag.StringVar(&cfg.YDBTokenFile, "ydb-token-file", "", "Path to file with YDB IAM access token (optional)")
+	flag.StringVar(&cfg.YDBSAKeyFile, "ydb-sa-key-file", "", "Path to Yandex Cloud service account authorized key JSON (optional)")
+	flag.BoolVar(&cfg.YDBYCMetadata, "ydb-yc-metadata", false, "Use Yandex Cloud metadata service credentials (VM or Cloud Functions)")
 	flag.BoolVar(&cfg.YDBDebug, "ydb-debug", false, "Enable YDB SDK trace logs (driver, table, query, retry) for debugging hangs")
 	flag.BoolVar(&cfg.YDBWarn, "ydb-warn", false, "Enable YDB SDK logs at WARN level and above only")
 	flag.BoolVar(&cfg.SchemaOnly, "schema-only", false, "Only create schema in YDB, do not transfer data")
@@ -77,6 +81,9 @@ func Parse() (*Config, error) {
 	if cfg.YDBEndpoint == "" {
 		return nil, fmt.Errorf("ydb endpoint is required: set -ydb-endpoint (or -ydb) or YDB_ENDPOINT env")
 	}
+	if err := cfg.validateYDBAuth(); err != nil {
+		return nil, err
+	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 10_000
 	}
@@ -87,4 +94,21 @@ func Parse() (*Config, error) {
 		cfg.ParallelTables = 1
 	}
 	return cfg, nil
+}
+
+func (cfg *Config) validateYDBAuth() error {
+	methods := 0
+	if cfg.YDBTokenFile != "" {
+		methods++
+	}
+	if cfg.YDBSAKeyFile != "" {
+		methods++
+	}
+	if cfg.YDBYCMetadata {
+		methods++
+	}
+	if methods > 1 {
+		return fmt.Errorf("ydb auth: use only one of -ydb-token-file, -ydb-sa-key-file, -ydb-yc-metadata")
+	}
+	return nil
 }
