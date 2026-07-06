@@ -48,18 +48,7 @@ func main() {
 		mysqldb.SetMaxIdleConns(cfg.ParallelTables)
 	}
 
-	ydbConn := cfg.YDBEndpoint
-	if !strings.Contains(ydbConn, "?database=") && cfg.YDBDatabase != "" {
-		ydbConn = strings.TrimSuffix(ydbConn, "/") + "/" + strings.TrimPrefix(cfg.YDBDatabase, "/")
-	}
 	ydbOpts := []ydbsdk.Option{}
-	if cfg.YDBTokenFile != "" {
-		token, err := os.ReadFile(cfg.YDBTokenFile)
-		if err != nil {
-			log.Fatalf("ydb-token-file: %v", err)
-		}
-		ydbOpts = append(ydbOpts, ydbsdk.WithAccessTokenCredentials(strings.TrimSpace(string(token))))
-	}
 	if cfg.YDBDebug {
 		ydbOpts = append(ydbOpts, ydbsdk.WithLogger(
 			ydblog.Default(os.Stdout, ydblog.WithMinLevel(ydblog.DEBUG), ydblog.WithLogQuery()),
@@ -73,7 +62,7 @@ func main() {
 		))
 		log.Println("YDB SDK WARN+ logging enabled (-ydb-warn)")
 	}
-	ydbdb, err := ydbsdk.Open(ctx, ydbConn, ydbOpts...)
+	ydbdb, err := ydb.Open(ctx, cfg, ydbOpts...)
 	if err != nil {
 		log.Fatalf("ydb: %v", err)
 	}
