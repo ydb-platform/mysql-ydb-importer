@@ -3,7 +3,6 @@ package ydb
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -67,37 +66,38 @@ var epochZero = time.Unix(0, 0).UTC()
 func GetCompletedTables(ctx context.Context, db Client, database string, extraOpts ...query.ExecuteOption) ([]string, error) {
 	tablePath := StateTablePath(database)
 	queryText := fmt.Sprintf(`
-		DECLARE $min_completed AS Datetime;
 		SELECT table_name FROM %s WHERE completed_at > $min_completed
 	`, quoteTablePath(tablePath))
+	// Client-level Query (not tx.Query inside DoTx): the YDB SDK only wires WithIssuesHandler
+	// on Client.Query/Client.Exec, so IssuesHandler() in extraOpts is silently ignored on
+	// transaction-scoped calls. A snapshot-RO tx control gives the same read isolation as DoTx.
+	queryOpts := append([]query.ExecuteOption{
+		query.WithParameters(ydbsdk.ParamsBuilder().Param("$min_completed").Datetime(epochZero).Build()),
+		query.WithTxControl(query.SnapshotReadOnlyTxControl()),
+		query.WithIdempotent(),
+	}, extraOpts...)
+	res, err := db.Query().Query(ctx, queryText, queryOpts...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = res.Close(ctx) }()
 	var out []string
-	err := db.Query().DoTx(ctx, func(ctx context.Context, tx query.TxActor) error {
-		queryOpts := append([]query.ExecuteOption{
-			query.WithParameters(ydbsdk.ParamsBuilder().Param("$min_completed").Datetime(epochZero).Build()),
-		}, extraOpts...)
-		res, err := tx.Query(ctx, queryText, queryOpts...)
+	for rs, err := range res.ResultSets(ctx) {
 		if err != nil {
-			return err
+			return nil, err
 		}
-		defer func() { _ = res.Close(ctx) }()
-		for rs, err := range res.ResultSets(ctx) {
+		for row, err := range rs.Rows(ctx) {
 			if err != nil {
-				return err
+				return nil, err
 			}
-			for row, err := range rs.Rows(ctx) {
-				if err != nil {
-					return err
-				}
-				var name string
-				if err := row.ScanNamed(query.Named("table_name", &name)); err != nil {
-					return err
-				}
-				out = append(out, name)
+			var name string
+			if err := row.ScanNamed(query.Named("table_name", &name)); err != nil {
+				return nil, err
 			}
+			out = append(out, name)
 		}
-		return nil
-	}, query.WithIdempotent(), query.WithTxSettings(query.TxSettings(query.WithSnapshotReadOnly())))
-	return out, err
+	}
+	return out, nil
 }
 
 // MarkTableCompleted records that the table was successfully migrated (BulkUpsert one row, completed_at = now).
@@ -145,45 +145,82 @@ func SaveProgress(ctx context.Context, db TableClient, database string, tableNam
 
 // GetProgress returns saved progress for the table (cursor for next read, rows_so_far). ok=false if none or table already completed.
 // extraOpts are appended to the query execution (e.g. IssuesHandler() to log YQL issues under -ydb-debug).
+//
+// Uses an aggregate (COUNT(*) + MAX) so the query always returns exactly one row, even when no progress is
+// saved. This avoids query.ErrNoRows, which the YDB SDK trace logger surfaces as a scary (but harmless)
+// "query pool with failed" DEBUG line under -ydb-debug. table_name is the primary key, so at most one row
+// matches and MAX() returns that row's value (or NULL when the set is empty).
 func GetProgress(ctx context.Context, db Client, database string, tableName string, extraOpts ...query.ExecuteOption) (cursor []interface{}, rowsSoFar int, ok bool, err error) {
 	tablePath := StateTablePath(database)
-	queryText := fmt.Sprintf("SELECT resume_cursor, rows_so_far, completed_at FROM %s WHERE table_name = $name", quoteTablePath(tablePath))
-	var cursorJSON string
-	var rows uint64
-	var completedAt time.Time
-	err = db.Query().DoTx(ctx, func(ctx context.Context, tx query.TxActor) error {
-		queryOpts := append([]query.ExecuteOption{
-			query.WithParameters(ydbsdk.ParamsBuilder().Param("$name").Text(tableName).Build()),
-		}, extraOpts...)
-		row, err := tx.QueryRow(ctx, queryText, queryOpts...)
-		if err != nil {
-			return err
-		}
-		return row.ScanNamed(
-			query.Named("resume_cursor", &cursorJSON),
-			query.Named("rows_so_far", &rows),
-			query.Named("completed_at", &completedAt),
-		)
-	}, query.WithIdempotent(), query.WithTxSettings(query.TxSettings(query.WithSnapshotReadOnly())))
+	queryText := fmt.Sprintf(`
+		SELECT
+			COUNT(*) AS cnt,
+			MAX(resume_cursor) AS resume_cursor,
+			MAX(rows_so_far) AS rows_so_far,
+			MAX(completed_at) AS completed_at
+		FROM %s
+		WHERE table_name = $name
+	`, quoteTablePath(tablePath))
+	var (
+		cnt         uint64
+		cursorJSON  *string
+		rows        *uint64
+		completedAt *time.Time
+	)
+	// Client-level Query (not tx.QueryRow inside DoTx) so IssuesHandler() in extraOpts actually
+	// fires: the YDB SDK only wires WithIssuesHandler on Client.Query/Client.Exec, not on
+	// transaction- or QueryRow-scoped calls. Snapshot-RO tx control matches the DoTx isolation.
+	queryOpts := append([]query.ExecuteOption{
+		query.WithParameters(ydbsdk.ParamsBuilder().Param("$name").Text(tableName).Build()),
+		query.WithTxControl(query.SnapshotReadOnlyTxControl()),
+		query.WithIdempotent(),
+	}, extraOpts...)
+	res, err := db.Query().Query(ctx, queryText, queryOpts...)
 	if err != nil {
-		if errors.Is(err, query.ErrNoRows) {
-			return nil, 0, false, nil
-		}
 		return nil, 0, false, err
 	}
-	if cursorJSON == "" {
+	defer func() { _ = res.Close(ctx) }()
+	// The aggregate query always returns exactly one row; scan it from the first result set.
+	scanned := false
+	for rs, err := range res.ResultSets(ctx) {
+		if err != nil {
+			return nil, 0, false, err
+		}
+		for row, err := range rs.Rows(ctx) {
+			if err != nil {
+				return nil, 0, false, err
+			}
+			if err := row.ScanNamed(
+				query.Named("cnt", &cnt),
+				query.Named("resume_cursor", &cursorJSON),
+				query.Named("rows_so_far", &rows),
+				query.Named("completed_at", &completedAt),
+			); err != nil {
+				return nil, 0, false, err
+			}
+			scanned = true
+		}
+	}
+	if !scanned {
 		return nil, 0, false, nil
 	}
-	// Do not resume if already completed
-	if !completedAt.IsZero() && completedAt.Unix() > 0 {
+	// No saved progress for this table.
+	if cnt == 0 || cursorJSON == nil || *cursorJSON == "" {
+		return nil, 0, false, nil
+	}
+	// Do not resume if already completed.
+	if completedAt != nil && !completedAt.IsZero() && completedAt.Unix() > 0 {
 		return nil, 0, false, nil
 	}
 	var arr []interface{}
-	if err := json.Unmarshal([]byte(cursorJSON), &arr); err != nil {
+	if err := json.Unmarshal([]byte(*cursorJSON), &arr); err != nil {
 		return nil, 0, false, err
 	}
 	cursor = jsonToCursor(arr)
-	return cursor, int(rows), true, nil
+	if rows != nil {
+		rowsSoFar = int(*rows)
+	}
+	return cursor, rowsSoFar, true, nil
 }
 
 // cursorToJSON converts []interface{} to a JSON-serializable slice (e.g. int64->float for numbers).

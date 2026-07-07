@@ -309,16 +309,10 @@ func (w *BulkUpsertWriter) writeChunkTx(ctx context.Context, meta *schema.TableM
 		return 0, fmt.Errorf("no matching columns between YDB table %s and MySQL table %s", tablePath, meta.Name)
 	}
 	log.Printf("  [ydb] %s: writeChunkTx start (%d rows)", meta.Name, len(rows))
-	// Build DECLARE $data AS List<Struct<col1: Type1, ...>> from YDB schema so types match exactly (Optional vs required, Date/Datetime/Timestamp).
-	structParts := make([]string, 0, len(ydbCols))
-	for _, ydbName := range ydbCols {
-		yqlType := colYQL[ydbName]
-		escaped := "`" + strings.ReplaceAll(ydbName, "`", "``") + "`"
-		structParts = append(structParts, escaped+": "+yqlType)
-	}
+	// Parameter types (Optional vs required, Date/Datetime/Timestamp) are carried by the typed
+	// $data value itself, so the query service infers them without an explicit DECLARE.
 	quotedPath := "`" + strings.ReplaceAll(tablePath, "`", "``") + "`"
-	queryText := fmt.Sprintf("DECLARE $data AS List<Struct<%s>>;\nUPSERT INTO %s SELECT * FROM AS_TABLE($data);",
-		strings.Join(structParts, ", "), quotedPath)
+	queryText := fmt.Sprintf("UPSERT INTO %s SELECT * FROM AS_TABLE($data);", quotedPath)
 
 	chunks := partitionRowsBySize(rows, meta, maxTxExecBytes)
 	log.Printf("  [ydb] %s: writeChunkTx upserting %d rows in %d batch(es) (max %d MB/batch)", meta.Name, len(rows), len(chunks), maxTxExecBytes/(1024*1024))
@@ -347,9 +341,10 @@ func (w *BulkUpsertWriter) writeChunkTx(ctx context.Context, meta *schema.TableM
 			if i == len(chunks)-1 {
 				opts = append(opts, query.WithCommit())
 			}
-			if w.debugIssues {
-				opts = append(opts, IssuesHandler())
-			}
+			// NOTE: IssuesHandler() is intentionally not attached here. The YDB SDK only wires
+			// WithIssuesHandler on client-level Query/Exec, not on transaction-scoped tx.Exec, so
+			// it would be silently ignored. Issues from *failed* statements are still logged via
+			// LogIssuesIfDebug on the error returned by DoTx below.
 			if err := tx.Exec(ctx, queryText, opts...); err != nil {
 				if isValueRepresentationError(err) {
 					logParameterTypes(meta.Name, ydbCols, metaByNameLower)

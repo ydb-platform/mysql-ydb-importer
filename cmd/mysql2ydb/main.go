@@ -61,6 +61,9 @@ func main() {
 			ydblog.Default(os.Stdout, ydblog.WithMinLevel(ydblog.DEBUG), ydblog.WithLogQuery()),
 			ydbtrace.DetailsAll,
 		))
+		// Surface YQL issues from successful unary operations (e.g. BulkUpsert), which the
+		// default SDK logger does not print and which have no per-call issues callback.
+		ydbOpts = append(ydbOpts, ydb.IssueLoggingDriver())
 		log.Println("YDB SDK trace logging enabled (-ydb-debug)")
 	} else if cfg.YDBWarn {
 		ydbOpts = append(ydbOpts, ydbsdk.WithLogger(
