@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
+	ydbsdk "github.com/ydb-platform/ydb-go-sdk/v3"
 	"github.com/ydb-platform/ydb-go-sdk/v3/query"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/types"
-	ydbsdk "github.com/ydb-platform/ydb-go-sdk/v3"
 )
 
 // StateTableName is the single YDB table for migration state: progress (resume cursor, rows_so_far) and completion (completed_at, row_count).
@@ -63,7 +63,8 @@ func CreateStateTable(ctx context.Context, q QueryExecer, database string) error
 var epochZero = time.Unix(0, 0).UTC()
 
 // GetCompletedTables returns table names that are already recorded as migrated (completed_at > epoch).
-func GetCompletedTables(ctx context.Context, db Client, database string) ([]string, error) {
+// extraOpts are appended to the query execution (e.g. IssuesHandler() to log YQL issues under -ydb-debug).
+func GetCompletedTables(ctx context.Context, db Client, database string, extraOpts ...query.ExecuteOption) ([]string, error) {
 	tablePath := StateTablePath(database)
 	queryText := fmt.Sprintf(`
 		DECLARE $min_completed AS Datetime;
@@ -71,9 +72,10 @@ func GetCompletedTables(ctx context.Context, db Client, database string) ([]stri
 	`, quoteTablePath(tablePath))
 	var out []string
 	err := db.Query().DoTx(ctx, func(ctx context.Context, tx query.TxActor) error {
-		res, err := tx.Query(ctx, queryText,
+		queryOpts := append([]query.ExecuteOption{
 			query.WithParameters(ydbsdk.ParamsBuilder().Param("$min_completed").Datetime(epochZero).Build()),
-		)
+		}, extraOpts...)
+		res, err := tx.Query(ctx, queryText, queryOpts...)
 		if err != nil {
 			return err
 		}
@@ -142,16 +144,18 @@ func SaveProgress(ctx context.Context, db TableClient, database string, tableNam
 }
 
 // GetProgress returns saved progress for the table (cursor for next read, rows_so_far). ok=false if none or table already completed.
-func GetProgress(ctx context.Context, db Client, database string, tableName string) (cursor []interface{}, rowsSoFar int, ok bool, err error) {
+// extraOpts are appended to the query execution (e.g. IssuesHandler() to log YQL issues under -ydb-debug).
+func GetProgress(ctx context.Context, db Client, database string, tableName string, extraOpts ...query.ExecuteOption) (cursor []interface{}, rowsSoFar int, ok bool, err error) {
 	tablePath := StateTablePath(database)
 	queryText := fmt.Sprintf("SELECT resume_cursor, rows_so_far, completed_at FROM %s WHERE table_name = $name", quoteTablePath(tablePath))
 	var cursorJSON string
 	var rows uint64
 	var completedAt time.Time
 	err = db.Query().DoTx(ctx, func(ctx context.Context, tx query.TxActor) error {
-		row, err := tx.QueryRow(ctx, queryText,
+		queryOpts := append([]query.ExecuteOption{
 			query.WithParameters(ydbsdk.ParamsBuilder().Param("$name").Text(tableName).Build()),
-		)
+		}, extraOpts...)
+		row, err := tx.QueryRow(ctx, queryText, queryOpts...)
 		if err != nil {
 			return err
 		}
