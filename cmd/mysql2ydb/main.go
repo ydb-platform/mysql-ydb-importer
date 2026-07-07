@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"strings"
-	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mysql2ydb/mysql2ydb/internal/config"
@@ -19,9 +18,18 @@ import (
 	"github.com/mysql2ydb/mysql2ydb/internal/ydb"
 	ydbsdk "github.com/ydb-platform/ydb-go-sdk/v3"
 	ydblog "github.com/ydb-platform/ydb-go-sdk/v3/log"
+	ydbquery "github.com/ydb-platform/ydb-go-sdk/v3/query"
 	ydbtrace "github.com/ydb-platform/ydb-go-sdk/v3/trace"
 	"golang.org/x/sync/errgroup"
 )
+
+// queryIssueOpts returns query execute options that log YQL issues from successful queries when debug is on.
+func queryIssueOpts(debug bool) []ydbquery.ExecuteOption {
+	if !debug {
+		return nil
+	}
+	return []ydbquery.ExecuteOption{ydb.IssuesHandler()}
+}
 
 func main() {
 	cfg, err := config.Parse()
@@ -30,8 +38,7 @@ func main() {
 	}
 	log.Printf("ydb endpoint: %s", cfg.YDBEndpoint)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
-	defer cancel()
+	ctx := context.Background()
 
 	mysqldb, err := openMySQL(cfg.MySQLDSN)
 	if err != nil {
@@ -64,7 +71,7 @@ func main() {
 	}
 	ydbdb, err := ydb.Open(ctx, cfg, ydbOpts...)
 	if err != nil {
-		log.Fatalf("ydb: %v", err)
+		fatalYDB(cfg, err, "ydb: %v", err)
 	}
 	defer func() { _ = ydbdb.Close(ctx) }()
 
@@ -79,23 +86,31 @@ func main() {
 		log.Fatalf("tables: %v", err)
 	}
 
-	queryExec := ydb.QueryExecFunc(func(ctx context.Context, query string) error {
-		return ydbdb.Query().Exec(ctx, query)
+	queryExec := ydb.QueryExecFunc(func(ctx context.Context, q string) error {
+		var opts []ydbquery.ExecuteOption
+		if cfg.YDBDebug {
+			opts = append(opts, ydb.IssuesHandler())
+		}
+		err := ydbdb.Query().Exec(ctx, q, opts...)
+		if err != nil {
+			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
+		}
+		return err
 	})
 	stateTableExists, err := ydb.StateTableExists(ctx, ydbdb, dbPath)
 	if err != nil {
-		log.Fatalf("check state table: %v", err)
+		fatalYDB(cfg, err, "check state table: %v", err)
 	}
 	if cfg.ForceRecreate && !cfg.DataOnly {
 		log.Println("Force recreate: dropping all tables in YDB...")
 		for _, name := range tables {
 			if err := ydb.DropTable(ctx, queryExec, dbPath, name); err != nil {
-				log.Fatalf("drop table %s: %v", name, err)
+				fatalYDB(cfg, err, "drop table %s: %v", name, err)
 			}
 			log.Printf("  dropped table %s", name)
 		}
 		if err := ydb.DropTable(ctx, queryExec, dbPath, ydb.StateTableName); err != nil {
-			log.Fatalf("drop state table: %v", err)
+			fatalYDB(cfg, err, "drop state table: %v", err)
 		}
 		log.Printf("  dropped state table %s", ydb.StateTablePath(dbPath))
 		stateTableExists = false
@@ -109,13 +124,13 @@ func main() {
 				log.Fatalf("schema %s: %v", name, err)
 			}
 			if err := ydb.CreateTable(ctx, queryExec, dbPath, meta); err != nil {
-				log.Fatalf("create table %s: %v", name, err)
+				fatalYDB(cfg, err, "create table %s: %v", name, err)
 			}
 			log.Printf("  created table %s", name)
 		}
 		// Single state table (progress + completion) after all user tables.
 		if err := ydb.CreateStateTable(ctx, queryExec, dbPath); err != nil {
-			log.Fatalf("state table: %v", err)
+			fatalYDB(cfg, err, "state table: %v", err)
 		}
 		log.Printf("state table: %s", ydb.StateTablePath(dbPath))
 	} else if !cfg.DataOnly && stateTableExists {
@@ -129,13 +144,13 @@ func main() {
 
 	// Ensure state table exists (e.g. when -data-only).
 	if err := ydb.CreateStateTable(ctx, queryExec, dbPath); err != nil {
-		log.Fatalf("state table: %v", err)
+		fatalYDB(cfg, err, "state table: %v", err)
 	}
 	completedSet := make(map[string]bool)
 	if !cfg.Force {
-		completed, err := ydb.GetCompletedTables(ctx, ydbdb, dbPath)
+		completed, err := ydb.GetCompletedTables(ctx, ydbdb, dbPath, queryIssueOpts(cfg.YDBDebug)...)
 		if err != nil {
-			log.Fatalf("read migration status: %v", err)
+			fatalYDB(cfg, err, "read migration status: %v", err)
 		}
 		for _, n := range completed {
 			completedSet[n] = true
@@ -157,6 +172,9 @@ func main() {
 	}
 
 	writerOpts := []ydb.BulkUpsertWriterOption{}
+	if cfg.YDBDebug {
+		writerOpts = append(writerOpts, ydb.WithDebugIssues(true))
+	}
 	if cfg.ForceTxUpsert {
 		writerOpts = append(writerOpts, ydb.WithForceTxUpsert(true))
 		log.Println("Using transactional UPSERT (-ydb-force-tx-upsert)")
@@ -178,8 +196,9 @@ func main() {
 		if err != nil {
 			return fmt.Errorf("schema %s: %w", name, err)
 		}
-		initialCursor, initialTotal, _, err := ydb.GetProgress(ctx, ydbdb, dbPath, name)
+		initialCursor, initialTotal, _, err := ydb.GetProgress(ctx, ydbdb, dbPath, name, queryIssueOpts(cfg.YDBDebug)...)
 		if err != nil {
+			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 			return fmt.Errorf("progress %s: %w", name, err)
 		}
 		batchSize := batchSizeForTable(cfg.BatchSize, cfg.MaxChunkRows, freeRAM, mysqldb, name)
@@ -220,20 +239,16 @@ func main() {
 		g.Go(func() error {
 			total := initialTotal
 			for msg := range ch {
-				writeCtx, cancel := context.WithTimeout(gCtx, 15*time.Minute)
-				written, err := writer.WriteChunk(writeCtx, meta, msg.rows)
-				cancel()
+				written, err := writer.WriteChunk(gCtx, meta, msg.rows)
 				if err != nil {
 					return err
 				}
 				total += written
 				prog.Update(name, total)
-				saveCtx, saveCancel := context.WithTimeout(gCtx, time.Minute)
-				if err := ydb.SaveProgress(saveCtx, ydbdb, dbPath, name, msg.next, total); err != nil {
-					saveCancel()
+				if err := ydb.SaveProgress(gCtx, ydbdb, dbPath, name, msg.next, total); err != nil {
+					ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 					return fmt.Errorf("save progress to %s: %w", ydb.StateTablePath(dbPath), err)
 				}
-				saveCancel()
 			}
 			totalCh <- total
 			return nil
@@ -243,6 +258,7 @@ func main() {
 		}
 		total := <-totalCh
 		if err := ydb.MarkTableCompleted(ctx, ydbdb, dbPath, name, total); err != nil {
+			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 			return fmt.Errorf("mark %s completed: %w", name, err)
 		}
 		prog.SetDone(name, total)
@@ -253,7 +269,7 @@ func main() {
 		for _, name := range pending {
 			if err := transferTable(ctx, name); err != nil {
 				prog.Stop()
-				log.Fatalf("  %v", err)
+				fatalYDB(cfg, err, "  %v", err)
 			}
 		}
 	} else {
@@ -266,11 +282,17 @@ func main() {
 		}
 		if err := g.Wait(); err != nil {
 			prog.Stop()
-			log.Fatalf("transfer: %v", err)
+			fatalYDB(cfg, err, "transfer: %v", err)
 		}
 	}
 	prog.Stop()
 	log.Println("Done.")
+}
+
+// fatalYDB logs any YQL/operation issues carried by err (only when -ydb-debug is on), then exits.
+func fatalYDB(cfg *config.Config, err error, format string, args ...interface{}) {
+	ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
+	log.Fatalf(format, args...)
 }
 
 func openMySQL(dsn string) (*sql.DB, error) {

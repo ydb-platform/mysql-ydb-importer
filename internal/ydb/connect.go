@@ -5,14 +5,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/mysql2ydb/mysql2ydb/internal/config"
 	yc "github.com/ydb-platform/ydb-go-yc"
 	ydbsdk "github.com/ydb-platform/ydb-go-sdk/v3"
 )
-
-const connectTimeout = 60 * time.Second
 
 // ConnectionString builds a YDB DSN from endpoint and database path.
 func ConnectionString(endpoint, database string) string {
@@ -54,10 +51,7 @@ func Open(ctx context.Context, cfg *config.Config, extraOpts ...ydbsdk.Option) (
 	}
 	opts = append(opts, authOpts...)
 
-	connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
-	defer cancel()
-
-	db, err := ydbsdk.Open(connectCtx, dsn, opts...)
+	db, err := ydbsdk.Open(ctx, dsn, opts...)
 	if err != nil {
 		return nil, err
 	}

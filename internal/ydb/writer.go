@@ -37,15 +37,16 @@ const maxTxExecBytes = 40 * 1024 * 1024
 // mu protects only in-memory caches (checkedTables, txOnlyTables, ydbColumns, etc.).
 // BulkUpsert, DoTx, and DescribeTable are never called under mu so concurrent WriteChunk calls can run in parallel.
 type BulkUpsertWriter struct {
-	mu                sync.Mutex
-	db                Client
-	database          string
-	forceTxUpsert     bool   // skip BulkUpsert, use writeChunkTx only (workaround when BulkUpsert hangs)
-	checkedTables     map[string]struct{}
-	txOnlyTables      map[string]struct{}     // tables that require tx path (BulkUpsert not supported), checked once
-	ydbColumns        map[string][]string            // column names per table
-	ydbColumnIsText   map[string]map[string]bool      // tablePath -> columnName -> true if YDB type is Utf8/Text (not String)
-	ydbColumnYQL      map[string]map[string]string   // tablePath -> columnName -> YQL type (e.g. "Uint32", "Optional<Uint32>") for BulkUpsert type coercion
+	mu              sync.Mutex
+	db              Client
+	database        string
+	forceTxUpsert   bool // skip BulkUpsert, use writeChunkTx only (workaround when BulkUpsert hangs)
+	debugIssues     bool // log YQL issues from YDB errors when -ydb-debug is on
+	checkedTables   map[string]struct{}
+	txOnlyTables    map[string]struct{}          // tables that require tx path (BulkUpsert not supported), checked once
+	ydbColumns      map[string][]string          // column names per table
+	ydbColumnIsText map[string]map[string]bool   // tablePath -> columnName -> true if YDB type is Utf8/Text (not String)
+	ydbColumnYQL    map[string]map[string]string // tablePath -> columnName -> YQL type (e.g. "Uint32", "Optional<Uint32>") for BulkUpsert type coercion
 }
 
 // BulkUpsertWriterOption configures the writer.
@@ -54,6 +55,11 @@ type BulkUpsertWriterOption func(*BulkUpsertWriter)
 // WithForceTxUpsert makes the writer use transactional UPSERT instead of BulkUpsert.
 func WithForceTxUpsert(force bool) BulkUpsertWriterOption {
 	return func(w *BulkUpsertWriter) { w.forceTxUpsert = force }
+}
+
+// WithDebugIssues enables logging of YQL/operation issues from YDB errors (-ydb-debug).
+func WithDebugIssues(debug bool) BulkUpsertWriterOption {
+	return func(w *BulkUpsertWriter) { w.debugIssues = debug }
 }
 
 // NewBulkUpsertWriter creates a writer that calls BulkUpsert with table.WithIdempotent().
@@ -82,6 +88,7 @@ func (w *BulkUpsertWriter) WriteChunk(ctx context.Context, meta *schema.TableMet
 	}
 	tablePath := path.Join(w.database, meta.Name)
 	if err := w.checkYDBKeyColumns(ctx, tablePath, meta); err != nil {
+		LogIssuesIfDebug(w.debugIssues, err)
 		return 0, err
 	}
 	w.mu.Lock()
@@ -133,6 +140,7 @@ func (w *BulkUpsertWriter) WriteChunk(ctx context.Context, meta *schema.TableMet
 	if err == nil {
 		return len(rows), nil
 	}
+	LogIssuesIfDebug(w.debugIssues, err)
 	// Fallback for tables with sync indexes: "Only async-indexed tables are supported by BulkUpsert"
 	if strings.Contains(err.Error(), "Only async-indexed tables are supported") {
 		w.mu.Lock()
@@ -171,6 +179,7 @@ func (w *BulkUpsertWriter) checkYDBKeyColumns(ctx context.Context, tablePath str
 		return nil
 	}, table.WithIdempotent())
 	if err != nil {
+		LogIssuesIfDebug(w.debugIssues, err)
 		return err
 	}
 	var missing []string
@@ -338,6 +347,9 @@ func (w *BulkUpsertWriter) writeChunkTx(ctx context.Context, meta *schema.TableM
 			if i == len(chunks)-1 {
 				opts = append(opts, query.WithCommit())
 			}
+			if w.debugIssues {
+				opts = append(opts, IssuesHandler())
+			}
 			if err := tx.Exec(ctx, queryText, opts...); err != nil {
 				if isValueRepresentationError(err) {
 					logParameterTypes(meta.Name, ydbCols, metaByNameLower)
@@ -347,6 +359,7 @@ func (w *BulkUpsertWriter) writeChunkTx(ctx context.Context, meta *schema.TableM
 		}
 		return nil
 	}, query.WithIdempotent()); err != nil {
+		LogIssuesIfDebug(w.debugIssues, err)
 		return 0, err
 	}
 	return len(rows), nil
