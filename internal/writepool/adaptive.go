@@ -11,7 +11,7 @@ const (
 	defaultWindow      = time.Minute
 	defaultAdjustEvery = 30 * time.Second
 	defaultMinLimit    = 1
-	defaultMaxLimit    = 1000
+	defaultMaxLimit    = maxLimitCeil
 	increaseThreshold  = 0.98 // throughput flat or up → try more writers
 	decreaseThreshold  = 0.95 // throughput down → fewer writers
 )

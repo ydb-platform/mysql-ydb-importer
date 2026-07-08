@@ -212,7 +212,9 @@ func main() {
 	transferCtx, stopSignals := shutdown.NotifyContext(ctx)
 	defer stopSignals()
 
-	writePool := writepool.NewAdaptivePool(writepool.WithMaxLimit(writepool.DefaultMaxLimit()))
+	writeMax := writepool.MaxLimitForMemory(freeRAM, cfg.ParallelTables, cfg.BatchSize, 256)
+	log.Printf("Write pool max concurrency: %d (-parallel-tables=%d)", writeMax, cfg.ParallelTables)
+	writePool := writepool.NewAdaptivePool(writepool.WithMaxLimit(writeMax))
 	defer writePool.Close()
 
 	prog := progress.NewDisplay(pending)
@@ -232,17 +234,13 @@ func main() {
 			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 			return fmt.Errorf("progress %s: %w", name, err)
 		}
-		batchSize := batchSizeForTable(cfg.BatchSize, cfg.MaxChunkRows, freeRAM, mysqldb, name)
+		batchSize := batchSizeForTable(cfg.BatchSize, cfg.MaxChunkRows, freeRAM, cfg.ParallelTables, mysqldb, name)
 		reader := mysql.NewChunkReader(mysqldb, meta, batchSize)
 		type chunkMsg struct {
 			rows []map[string]interface{}
 			next []interface{}
 		}
-		chBuf := writePool.Limit() + 2
-		if chBuf < 4 {
-			chBuf = 4
-		}
-		ch := make(chan chunkMsg, chBuf)
+		ch := make(chan chunkMsg, writepool.ChunkChannelBuf())
 		var rowsSoFar atomic.Int64
 		rowsSoFar.Store(int64(initialTotal))
 		tracker := writepool.NewOrderedTracker(initialTotal, func(saveCtx context.Context, nextCursor []interface{}, total int) error {
@@ -288,10 +286,10 @@ func main() {
 				msg := msg
 				idx := chunkIdx
 				chunkIdx++
+				if err := writePool.Acquire(writeCtx); err != nil {
+					return err
+				}
 				writeG.Go(func() error {
-					if err := writePool.Acquire(writeCtx); err != nil {
-						return err
-					}
 					defer writePool.Release(len(msg.rows))
 					written, err := writer.WriteChunk(writeCtx, meta, msg.rows)
 					if err != nil {
@@ -368,10 +366,13 @@ func openMySQL(dsn string) (*sql.DB, error) {
 // - one chunk fits in a fraction of available RAM;
 // - one chunk is downloaded from MySQL in ≤10s at 100 Mbit/s (125 MB);
 // - never exceeds maxChunkRows.
-func batchSizeForTable(configBatch, maxChunkRows int, freeRAM uint64, db *sql.DB, tableName string) int {
+func batchSizeForTable(configBatch, maxChunkRows int, freeRAM uint64, parallelTables int, db *sql.DB, tableName string) int {
 	batch := configBatch
 	if maxChunkRows > 0 && batch > maxChunkRows {
 		batch = maxChunkRows
+	}
+	if parallelTables > 1 && freeRAM > 0 {
+		freeRAM /= uint64(parallelTables)
 	}
 	dataLen, rowCount, err := schema.TableSize(db, tableName)
 	var avgRowBytes uint64
