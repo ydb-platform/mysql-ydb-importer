@@ -15,6 +15,7 @@ import (
 	"github.com/mysql2ydb/mysql2ydb/internal/mysql"
 	"github.com/mysql2ydb/mysql2ydb/internal/progress"
 	"github.com/mysql2ydb/mysql2ydb/internal/schema"
+	"github.com/mysql2ydb/mysql2ydb/internal/shutdown"
 	"github.com/mysql2ydb/mysql2ydb/internal/ydb"
 	ydbsdk "github.com/ydb-platform/ydb-go-sdk/v3"
 	ydblog "github.com/ydb-platform/ydb-go-sdk/v3/log"
@@ -197,12 +198,16 @@ func main() {
 		log.Printf("Available RAM for chunks: %.1f GiB", float64(freeRAM)/(1<<30))
 	}
 	log.Println("Transferring data (chunked BulkUpsert, idempotent)...")
+	transferCtx, stopSignals := shutdown.NotifyContext(ctx)
+	defer stopSignals()
+
 	prog := progress.NewDisplay(pending)
 	prog.ReserveLines()
-	progressCtx, progressCancel := context.WithCancel(ctx)
+	progressCtx, progressCancel := context.WithCancel(transferCtx)
 	defer progressCancel()
 	go prog.Run(progressCtx)
 
+	var transferErr error
 	transferTable := func(ctx context.Context, name string) error {
 		meta, err := schema.LoadTableMeta(mysqldb, name)
 		if err != nil {
@@ -223,6 +228,7 @@ func main() {
 		totalCh := make(chan int, 1)
 		g, gCtx := errgroup.WithContext(ctx)
 		g.Go(func() error {
+			defer close(ch)
 			cursor := initialCursor
 			for {
 				rows, next, hasMore, err := reader.ReadChunk(gCtx, cursor)
@@ -245,7 +251,6 @@ func main() {
 				}
 				cursor = next
 			}
-			close(ch)
 			return nil
 		})
 		g.Go(func() error {
@@ -257,7 +262,7 @@ func main() {
 				}
 				total += written
 				prog.Update(name, total)
-				if err := ydb.SaveProgress(gCtx, ydbdb, dbPath, name, msg.next, total); err != nil {
+				if err := ydb.SaveProgressFlushing(gCtx, ydbdb, dbPath, name, msg.next, total); err != nil {
 					ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 					return fmt.Errorf("save progress to %s: %w", ydb.StateTablePath(dbPath), err)
 				}
@@ -279,25 +284,29 @@ func main() {
 
 	if cfg.ParallelTables <= 1 {
 		for _, name := range pending {
-			if err := transferTable(ctx, name); err != nil {
-				prog.Stop()
-				fatalYDB(cfg, err, "  %v", err)
+			if err := transferTable(transferCtx, name); err != nil {
+				transferErr = err
+				break
 			}
 		}
 	} else {
-		g := new(errgroup.Group)
+		g, gCtx := errgroup.WithContext(transferCtx)
 		for _, name := range pending {
 			name := name
 			g.Go(func() error {
-				return transferTable(ctx, name)
+				return transferTable(gCtx, name)
 			})
 		}
-		if err := g.Wait(); err != nil {
-			prog.Stop()
-			fatalYDB(cfg, err, "transfer: %v", err)
-		}
+		transferErr = g.Wait()
 	}
 	prog.Stop()
+	if transferErr != nil {
+		if shutdown.IsInterrupt(transferErr) {
+			shutdown.LogInterrupt()
+			os.Exit(130)
+		}
+		fatalYDB(cfg, transferErr, "transfer: %v", transferErr)
+	}
 	log.Println("Done.")
 }
 

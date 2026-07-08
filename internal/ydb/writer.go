@@ -30,8 +30,9 @@ type Client interface {
 	Query() query.Client
 }
 
-// maxTxExecBytes is the max estimated params size per tx.Exec (YDB limit 50MB). Use 40MB so estimation error stays under limit.
-const maxTxExecBytes = 40 * 1024 * 1024
+// maxChunkPayloadBytes is the max estimated payload size per write batch (BulkUpsert or tx.Exec).
+// YDB limit is 50MB; use 40MB so estimation error stays under the limit.
+const maxChunkPayloadBytes = 40 * 1024 * 1024
 
 // BulkUpsertWriter writes rows to YDB using idempotent BulkUpsert.
 // mu protects only in-memory caches (checkedTables, txOnlyTables, ydbColumns, etc.).
@@ -119,47 +120,57 @@ func (w *BulkUpsertWriter) WriteChunk(ctx context.Context, meta *schema.TableMet
 			colNamesForRow[i] = c.Name
 		}
 	}
-	log.Printf("  [ydb] %s: BulkUpsert %d rows", meta.Name, len(rows))
 	metaByNameLower := make(map[string]*schema.Column)
 	for i := range meta.Columns {
 		metaByNameLower[strings.ToLower(meta.Columns[i].Name)] = &meta.Columns[i]
 	}
-	ydbRows := make([]types.Value, 0, len(rows))
-	for _, row := range rows {
-		fields := make([]types.StructValueOption, 0, len(colNamesForRow))
-		for _, ydbName := range colNamesForRow {
-			col := metaByNameLower[strings.ToLower(ydbName)]
-			if col == nil {
-				continue
+	chunks := partitionRowsBySize(rows, meta, maxChunkPayloadBytes)
+	if len(chunks) > 1 {
+		log.Printf("  [ydb] %s: BulkUpsert %d rows in %d batch(es) (max %d MB/batch)", meta.Name, len(rows), len(chunks), maxChunkPayloadBytes/(1024*1024))
+	} else {
+		log.Printf("  [ydb] %s: BulkUpsert %d rows", meta.Name, len(rows))
+	}
+	rowsWritten = 0
+	for _, chunk := range chunks {
+		ydbRows := make([]types.Value, 0, len(chunk))
+		for _, row := range chunk {
+			fields := make([]types.StructValueOption, 0, len(colNamesForRow))
+			for _, ydbName := range colNamesForRow {
+				col := metaByNameLower[strings.ToLower(ydbName)]
+				if col == nil {
+					continue
+				}
+				ydbYQL := colYQL[ydbName]
+				v, err := mysqlValueToYDBForBulkUpsert(row[col.Name], col.DataType, col.Nullable, ydbYQL)
+				if err != nil {
+					return rowsWritten, fmt.Errorf("column %s: %w", col.Name, err)
+				}
+				fields = append(fields, types.StructFieldValue(ydbName, v))
 			}
-			ydbYQL := colYQL[ydbName]
-			v, err := mysqlValueToYDBForBulkUpsert(row[col.Name], col.DataType, col.Nullable, ydbYQL)
-			if err != nil {
-				return 0, fmt.Errorf("column %s: %w", col.Name, err)
-			}
-			fields = append(fields, types.StructFieldValue(ydbName, v))
+			ydbRows = append(ydbRows, types.StructValue(fields...))
 		}
-		ydbRows = append(ydbRows, types.StructValue(fields...))
+		list := types.ListValue(ydbRows...)
+		bulkCtx := ctx
+		if w.dumpOnIssuesDir != "" {
+			bulkCtx = WithBulkUpsertDumpContext(ctx, meta, tablePath, chunk)
+		}
+		err = w.db.Table().BulkUpsert(bulkCtx, tablePath, table.BulkUpsertDataRows(list), table.WithIdempotent())
+		if err == nil {
+			rowsWritten += len(chunk)
+			continue
+		}
+		LogIssuesIfDebug(w.debugIssues, err)
+		// Fallback for tables with sync indexes: "Only async-indexed tables are supported by BulkUpsert"
+		if strings.Contains(err.Error(), "Only async-indexed tables are supported") {
+			w.mu.Lock()
+			w.txOnlyTables[tablePath] = struct{}{}
+			w.mu.Unlock()
+			log.Printf("  [ydb] %s: BulkUpsert not supported (sync indexes), using tx upsert for this table", meta.Name)
+			return w.writeChunkTx(ctx, meta, rows, tablePath)
+		}
+		return rowsWritten, err
 	}
-	list := types.ListValue(ydbRows...)
-	bulkCtx := ctx
-	if w.dumpOnIssuesDir != "" {
-		bulkCtx = WithBulkUpsertDumpContext(ctx, meta, tablePath, rows)
-	}
-	err = w.db.Table().BulkUpsert(bulkCtx, tablePath, table.BulkUpsertDataRows(list), table.WithIdempotent())
-	if err == nil {
-		return len(rows), nil
-	}
-	LogIssuesIfDebug(w.debugIssues, err)
-	// Fallback for tables with sync indexes: "Only async-indexed tables are supported by BulkUpsert"
-	if strings.Contains(err.Error(), "Only async-indexed tables are supported") {
-		w.mu.Lock()
-		w.txOnlyTables[tablePath] = struct{}{}
-		w.mu.Unlock()
-		log.Printf("  [ydb] %s: BulkUpsert not supported (sync indexes), using tx upsert for this table", meta.Name)
-		return w.writeChunkTx(ctx, meta, rows, tablePath)
-	}
-	return 0, err
+	return rowsWritten, nil
 }
 
 // checkYDBKeyColumns ensures all YDB table key columns are present in the MySQL schema,
@@ -324,8 +335,8 @@ func (w *BulkUpsertWriter) writeChunkTx(ctx context.Context, meta *schema.TableM
 	quotedPath := "`" + strings.ReplaceAll(tablePath, "`", "``") + "`"
 	queryText := fmt.Sprintf("UPSERT INTO %s SELECT * FROM AS_TABLE($data);", quotedPath)
 
-	chunks := partitionRowsBySize(rows, meta, maxTxExecBytes)
-	log.Printf("  [ydb] %s: writeChunkTx upserting %d rows in %d batch(es) (max %d MB/batch)", meta.Name, len(rows), len(chunks), maxTxExecBytes/(1024*1024))
+	chunks := partitionRowsBySize(rows, meta, maxChunkPayloadBytes)
+	log.Printf("  [ydb] %s: writeChunkTx upserting %d rows in %d batch(es) (max %d MB/batch)", meta.Name, len(rows), len(chunks), maxChunkPayloadBytes/(1024*1024))
 
 	if err = w.db.Query().DoTx(ctx, func(ctx context.Context, tx query.TxActor) error {
 		for i, chunk := range chunks {
