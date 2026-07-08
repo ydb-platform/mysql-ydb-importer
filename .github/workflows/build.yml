@@ -70,13 +70,23 @@ jobs:
             --packager deb \
             --target dist/
 
-      - name: Upload artifacts
+      - name: Package binary archive
+        run: |
+          tar -czf "dist/mysql2ydb-${{ steps.version.outputs.version }}-linux-amd64.tar.gz" \
+            -C dist mysql2ydb
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mysql2ydb-linux-amd64
-          path: |
-            dist/mysql2ydb
-            dist/*.deb
+          name: mysql2ydb-${{ steps.version.outputs.version }}-linux-amd64.tar.gz
+          path: dist/mysql2ydb-${{ steps.version.outputs.version }}-linux-amd64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql2ydb_${{ steps.version.outputs.version }}_amd64.deb
+          path: dist/*.deb
           if-no-files-found: error
 
       - name: Upload release assets
@@ -85,6 +95,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${GITHUB_REF_NAME}" \
-            dist/mysql2ydb \
+            "dist/mysql2ydb-${{ steps.version.outputs.version }}-linux-amd64.tar.gz" \
             dist/*.deb \
             --clobber
