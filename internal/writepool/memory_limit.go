@@ -2,14 +2,27 @@ package writepool
 
 const (
 	maxLimitFloor        = 1
-	maxLimitCeil         = 32
+	maxLimitCeil         = 1000
 	chunkChannelBuf      = 4
 	chunkMemoryOverhead  = 3
 	writePoolRAMFraction = 0.4
+	minMemoryReserve     = 256 << 20 // 256 MiB
 )
 
 // ChunkChannelBuf is the per-table channel capacity between MySQL read and YDB write.
 func ChunkChannelBuf() int { return chunkChannelBuf }
+
+// MemoryReserve returns how much free RAM the write pool should try to keep.
+func MemoryReserve(freeBytes uint64) uint64 {
+	if freeBytes == 0 {
+		return minMemoryReserve
+	}
+	reserve := freeBytes / 10
+	if reserve < minMemoryReserve {
+		return minMemoryReserve
+	}
+	return reserve
+}
 
 // MaxLimitForMemory estimates a safe upper bound on concurrent chunk writes.
 func MaxLimitForMemory(freeBytes uint64, parallelTables, batchRows int, avgRowBytes uint64) int {

@@ -212,9 +212,13 @@ func main() {
 	transferCtx, stopSignals := shutdown.NotifyContext(ctx)
 	defer stopSignals()
 
-	writeMax := writepool.MaxLimitForMemory(freeRAM, cfg.ParallelTables, cfg.BatchSize, 256)
-	log.Printf("Write pool max concurrency: %d (-parallel-tables=%d)", writeMax, cfg.ParallelTables)
-	writePool := writepool.NewAdaptivePool(writepool.WithMaxLimit(writeMax))
+	writeReserve := writepool.MemoryReserve(freeRAM)
+	writePool := writepool.NewAdaptivePool(
+		writepool.WithMaxLimit(writepool.DefaultMaxLimit()),
+		writepool.WithMemoryReserve(writeReserve),
+	)
+	log.Printf("Write pool: max concurrency %d, RAM reserve %.1f GiB (-parallel-tables=%d)",
+		writepool.DefaultMaxLimit(), float64(writeReserve)/(1<<30), cfg.ParallelTables)
 	defer writePool.Close()
 
 	prog := progress.NewDisplay(pending)

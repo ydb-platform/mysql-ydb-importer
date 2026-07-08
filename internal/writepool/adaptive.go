@@ -5,6 +5,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/mysql2ydb/mysql2ydb/internal/memory"
 )
 
 const (
@@ -21,16 +23,17 @@ func DefaultMaxLimit() int { return defaultMaxLimit }
 
 // AdaptivePool limits concurrent chunk writes and tunes the limit from observed throughput.
 type AdaptivePool struct {
-	mu       sync.Mutex
-	limit    int
-	maxLimit int
-	inFlight int
-	samples  []sample
-	window   time.Duration
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	onAdjust func(oldLimit, newLimit int, rowsPerSec float64)
-	waiters  []chan struct{}
+	mu         sync.Mutex
+	limit      int
+	maxLimit   int
+	memReserve uint64 // keep at least this much RAM free; 0 disables memory checks
+	inFlight   int
+	samples    []sample
+	window     time.Duration
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	onAdjust   func(oldLimit, newLimit int, rowsPerSec float64)
+	waiters    []chan struct{}
 }
 
 type sample struct {
@@ -48,6 +51,12 @@ func WithMaxLimit(n int) PoolOption {
 			p.maxLimit = n
 		}
 	}
+}
+
+// WithMemoryReserve sets a minimum free-RAM threshold. The pool will not grow
+// while MemAvailable is below 2× reserve and will shrink when below reserve.
+func WithMemoryReserve(bytes uint64) PoolOption {
+	return func(p *AdaptivePool) { p.memReserve = bytes }
 }
 
 // WithOnAdjust is called when the pool changes its concurrency limit (optional).
@@ -196,23 +205,45 @@ func (p *AdaptivePool) adjust(prevRate float64) {
 	now := time.Now()
 	rate := p.rowsPerSecLocked(now)
 	old := p.limit
+
+	memTight := false
+	if free := memory.FreeBytes(); p.memReserve > 0 && free > 0 {
+		if free < p.memReserve && p.limit > defaultMinLimit {
+			p.limit--
+			p.logAdjust(old, rate, "memory pressure (%.1f GiB free, reserve %.1f GiB)",
+				float64(free)/(1<<30), float64(p.memReserve)/(1<<30))
+			p.wakeWaitersLocked()
+			return
+		}
+		memTight = free < p.memReserve*2
+	}
+
 	if prevRate > 0 && rate > 0 {
 		ratio := rate / prevRate
 		switch {
-		case ratio >= increaseThreshold && p.limit < p.maxLimit:
+		case ratio >= increaseThreshold && p.limit < p.maxLimit && !memTight:
 			p.limit++
 		case ratio < decreaseThreshold && p.limit > defaultMinLimit:
 			p.limit--
 		}
-	} else if rate > 0 && p.limit < p.maxLimit {
+	} else if rate > 0 && p.limit < p.maxLimit && !memTight {
 		p.limit++
 	}
 	if p.limit != old {
-		if p.onAdjust != nil {
-			p.onAdjust(old, p.limit, rate)
-		} else {
-			log.Printf("write pool: concurrency %d -> %d (%.0f rows/s over last minute)", old, p.limit, rate)
-		}
+		p.logAdjust(old, rate, "")
 		p.wakeWaitersLocked()
 	}
+}
+
+func (p *AdaptivePool) logAdjust(old int, rate float64, extra string, args ...interface{}) {
+	if p.onAdjust != nil {
+		p.onAdjust(old, p.limit, rate)
+		return
+	}
+	if extra != "" {
+		all := append([]interface{}{old, p.limit, rate}, args...)
+		log.Printf("write pool: concurrency %d -> %d (%.0f rows/s; "+extra+")", all...)
+		return
+	}
+	log.Printf("write pool: concurrency %d -> %d (%.0f rows/s over last minute)", old, p.limit, rate)
 }
