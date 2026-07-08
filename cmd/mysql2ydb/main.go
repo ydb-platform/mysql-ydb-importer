@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mysql2ydb/mysql2ydb/internal/config"
@@ -16,6 +17,7 @@ import (
 	"github.com/mysql2ydb/mysql2ydb/internal/progress"
 	"github.com/mysql2ydb/mysql2ydb/internal/schema"
 	"github.com/mysql2ydb/mysql2ydb/internal/shutdown"
+	"github.com/mysql2ydb/mysql2ydb/internal/writepool"
 	"github.com/mysql2ydb/mysql2ydb/internal/ydb"
 	ydbsdk "github.com/ydb-platform/ydb-go-sdk/v3"
 	ydblog "github.com/ydb-platform/ydb-go-sdk/v3/log"
@@ -46,15 +48,20 @@ func main() {
 		log.Fatalf("mysql: %v", err)
 	}
 	defer func() { _ = mysqldb.Close() }()
-	// Allow concurrent reads when transferring multiple tables in parallel.
+	// One MySQL reader per table; pool size follows table parallelism, not YDB write slots.
+	mysqlConns := 8
 	if cfg.ParallelTables > 1 {
-		n := cfg.ParallelTables * 2
-		if n < 8 {
-			n = 8
+		mysqlConns = cfg.ParallelTables * 2
+		if mysqlConns < 8 {
+			mysqlConns = 8
 		}
-		mysqldb.SetMaxOpenConns(n)
-		mysqldb.SetMaxIdleConns(cfg.ParallelTables)
 	}
+	mysqldb.SetMaxOpenConns(mysqlConns)
+	idle := cfg.ParallelTables
+	if idle < 4 {
+		idle = 4
+	}
+	mysqldb.SetMaxIdleConns(idle)
 
 	ydbOpts := []ydbsdk.Option{}
 	if cfg.YDBDebug {
@@ -197,9 +204,12 @@ func main() {
 	if freeRAM > 0 {
 		log.Printf("Available RAM for chunks: %.1f GiB", float64(freeRAM)/(1<<30))
 	}
-	log.Println("Transferring data (chunked BulkUpsert, idempotent)...")
+	log.Println("Transferring data (chunked BulkUpsert, idempotent, adaptive parallel writes)...")
 	transferCtx, stopSignals := shutdown.NotifyContext(ctx)
 	defer stopSignals()
+
+	writePool := writepool.NewAdaptivePool(writepool.WithMaxLimit(writepool.DefaultMaxLimit()))
+	defer writePool.Close()
 
 	prog := progress.NewDisplay(pending)
 	prog.ReserveLines()
@@ -224,8 +234,22 @@ func main() {
 			rows []map[string]interface{}
 			next []interface{}
 		}
-		ch := make(chan chunkMsg, 2)
-		totalCh := make(chan int, 1)
+		chBuf := writePool.Limit() + 2
+		if chBuf < 4 {
+			chBuf = 4
+		}
+		ch := make(chan chunkMsg, chBuf)
+		var rowsSoFar atomic.Int64
+		rowsSoFar.Store(int64(initialTotal))
+		tracker := writepool.NewOrderedTracker(initialTotal, func(saveCtx context.Context, nextCursor []interface{}, total int) error {
+			rowsSoFar.Store(int64(total))
+			prog.Update(name, total)
+			if err := ydb.SaveProgressFlushing(saveCtx, ydbdb, dbPath, name, nextCursor, total); err != nil {
+				ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
+				return fmt.Errorf("save progress to %s: %w", ydb.StateTablePath(dbPath), err)
+			}
+			return nil
+		})
 		g, gCtx := errgroup.WithContext(ctx)
 		g.Go(func() error {
 			defer close(ch)
@@ -254,26 +278,30 @@ func main() {
 			return nil
 		})
 		g.Go(func() error {
-			total := initialTotal
+			writeG, writeCtx := errgroup.WithContext(gCtx)
+			chunkIdx := 0
 			for msg := range ch {
-				written, err := writer.WriteChunk(gCtx, meta, msg.rows)
-				if err != nil {
-					return err
-				}
-				total += written
-				prog.Update(name, total)
-				if err := ydb.SaveProgressFlushing(gCtx, ydbdb, dbPath, name, msg.next, total); err != nil {
-					ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
-					return fmt.Errorf("save progress to %s: %w", ydb.StateTablePath(dbPath), err)
-				}
+				msg := msg
+				idx := chunkIdx
+				chunkIdx++
+				writeG.Go(func() error {
+					if err := writePool.Acquire(writeCtx); err != nil {
+						return err
+					}
+					defer writePool.Release(len(msg.rows))
+					written, err := writer.WriteChunk(writeCtx, meta, msg.rows)
+					if err != nil {
+						return err
+					}
+					return tracker.Complete(writeCtx, idx, msg.next, written)
+				})
 			}
-			totalCh <- total
-			return nil
+			return writeG.Wait()
 		})
 		if err := g.Wait(); err != nil {
 			return err
 		}
-		total := <-totalCh
+		total := int(rowsSoFar.Load())
 		if err := ydb.MarkTableCompleted(ctx, ydbdb, dbPath, name, total); err != nil {
 			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 			return fmt.Errorf("mark %s completed: %w", name, err)
@@ -291,6 +319,7 @@ func main() {
 		}
 	} else {
 		g, gCtx := errgroup.WithContext(transferCtx)
+		g.SetLimit(cfg.ParallelTables)
 		for _, name := range pending {
 			name := name
 			g.Go(func() error {
