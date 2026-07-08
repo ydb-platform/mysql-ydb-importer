@@ -182,12 +182,20 @@ func main() {
 		writerOpts = append(writerOpts, ydb.WithForceTxUpsert(true))
 		log.Println("Using transactional UPSERT (-ydb-force-tx-upsert)")
 	}
+	if cfg.YDBDumpFailedChunks != "" {
+		writerOpts = append(writerOpts, ydb.WithDumpFailedChunks(cfg.YDBDumpFailedChunks))
+		log.Printf("BulkUpsert failure dumps enabled (-ydb-dump-failed-chunks=%s)", cfg.YDBDumpFailedChunks)
+	}
+	if cfg.YDBBulkUpsertNonIdempotent {
+		writerOpts = append(writerOpts, ydb.WithBulkUpsertNonIdempotent(true))
+		log.Println("BulkUpsert SDK retries disabled (-ydb-bulkupsert-non-idempotent)")
+	}
 	writer := ydb.NewBulkUpsertWriter(ydbdb, dbPath, writerOpts...)
 	freeRAM := memory.FreeBytes()
 	if freeRAM > 0 {
 		log.Printf("Available RAM for chunks: %.1f GiB", float64(freeRAM)/(1<<30))
 	}
-	log.Println("Transferring data (chunked BulkUpsert, idempotent)...")
+	log.Println("Transferring data (chunked BulkUpsert)...")
 	prog := progress.NewDisplay(pending)
 	prog.ReserveLines()
 	progressCtx, progressCancel := context.WithCancel(ctx)

@@ -20,6 +20,8 @@ type Config struct {
 	YDBYCMetadata  bool   // use Yandex Cloud metadata service credentials (VM/Cloud Functions)
 	YDBDebug       bool   // enable YDB SDK trace logs (driver, table, query, retry)
 	YDBWarn        bool   // enable YDB SDK logs at WARN level and above only
+	YDBDumpFailedChunks      string // directory to dump BulkUpsert chunk JSON on failure (empty = disabled)
+	YDBBulkUpsertNonIdempotent bool   // disable BulkUpsert SDK retries (table.WithIdempotent(false))
 
 	// Migration
 	SchemaOnly     bool
@@ -46,6 +48,8 @@ func Parse() (*Config, error) {
 	flag.BoolVar(&cfg.YDBYCMetadata, "ydb-yc-metadata", false, "Use Yandex Cloud metadata service credentials (VM or Cloud Functions)")
 	flag.BoolVar(&cfg.YDBDebug, "ydb-debug", false, "Enable YDB SDK trace logs (driver, table, query, retry) for debugging hangs")
 	flag.BoolVar(&cfg.YDBWarn, "ydb-warn", false, "Enable YDB SDK logs at WARN level and above only")
+	flag.StringVar(&cfg.YDBDumpFailedChunks, "ydb-dump-failed-chunks", "", "Directory to dump failed BulkUpsert chunk data as JSON (for debugging)")
+	flag.BoolVar(&cfg.YDBBulkUpsertNonIdempotent, "ydb-bulkupsert-non-idempotent", false, "Disable BulkUpsert SDK retries (table.WithIdempotent(false); for debugging hangs)")
 	flag.BoolVar(&cfg.SchemaOnly, "schema-only", false, "Only create schema in YDB, do not transfer data")
 	flag.BoolVar(&cfg.DataOnly, "data-only", false, "Only transfer data (schema must already exist)")
 	flag.IntVar(&cfg.BatchSize, "batch-size", 10_000, "Number of rows per chunk for large tables")
