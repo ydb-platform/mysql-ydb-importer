@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mysql2ydb/mysql2ydb/internal/config"
@@ -62,6 +63,9 @@ func main() {
 		idle = 4
 	}
 	mysqldb.SetMaxIdleConns(idle)
+	// Drop idle connections before MySQL wait_timeout; parallel tables leave pool connections idle longer between chunk reads.
+	mysqldb.SetConnMaxLifetime(5 * time.Minute)
+	mysqldb.SetConnMaxIdleTime(90 * time.Second)
 
 	ydbOpts := []ydbsdk.Option{}
 	if cfg.YDBDebug {
@@ -257,7 +261,7 @@ func main() {
 			for {
 				rows, next, hasMore, err := reader.ReadChunk(gCtx, cursor)
 				if err != nil {
-					return err
+					return fmt.Errorf("mysql read: %w", err)
 				}
 				if len(rows) > 0 {
 					var nextSend []interface{}
@@ -291,15 +295,18 @@ func main() {
 					defer writePool.Release(len(msg.rows))
 					written, err := writer.WriteChunk(writeCtx, meta, msg.rows)
 					if err != nil {
-						return err
+						return fmt.Errorf("ydb write: %w", err)
 					}
-					return tracker.Complete(writeCtx, idx, msg.next, written)
+					if err := tracker.Complete(writeCtx, idx, msg.next, written); err != nil {
+						return fmt.Errorf("progress: %w", err)
+					}
+					return nil
 				})
 			}
 			return writeG.Wait()
 		})
 		if err := g.Wait(); err != nil {
-			return err
+			return fmt.Errorf("table %s: %w", name, err)
 		}
 		total := int(rowsSoFar.Load())
 		if err := ydb.MarkTableCompleted(ctx, ydbdb, dbPath, name, total); err != nil {
