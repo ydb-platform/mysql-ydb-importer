@@ -33,17 +33,16 @@ type Client interface {
 // maxTxExecBytes is the max estimated params size per tx.Exec (YDB limit 50MB). Use 40MB so estimation error stays under limit.
 const maxTxExecBytes = 40 * 1024 * 1024
 
-// BulkUpsertWriter writes rows to YDB using BulkUpsert (idempotent by default).
+// BulkUpsertWriter writes rows to YDB using idempotent BulkUpsert.
 // mu protects only in-memory caches (checkedTables, txOnlyTables, ydbColumns, etc.).
 // BulkUpsert, DoTx, and DescribeTable are never called under mu so concurrent WriteChunk calls can run in parallel.
 type BulkUpsertWriter struct {
 	mu              sync.Mutex
 	db              Client
 	database        string
-	forceTxUpsert          bool // skip BulkUpsert, use writeChunkTx only (workaround when BulkUpsert hangs)
-	debugIssues            bool // log YQL issues from YDB errors when -ydb-debug is on
-	dumpOnErrorDir         string // when set, dump failed BulkUpsert chunks to this directory (-ydb-dump-failed-chunks)
-	bulkUpsertNonIdempotent bool // pass table.WithIdempotent(false) to BulkUpsert (-ydb-bulkupsert-non-idempotent)
+	forceTxUpsert   bool // skip BulkUpsert, use writeChunkTx only (workaround when BulkUpsert hangs)
+	debugIssues     bool // log YQL issues from YDB errors when -ydb-debug is on
+	dumpOnIssuesDir string // dump BulkUpsert chunks when driver trace reports YQL issues (-ydb-dump-failed-chunks)
 	checkedTables   map[string]struct{}
 	txOnlyTables    map[string]struct{}          // tables that require tx path (BulkUpsert not supported), checked once
 	ydbColumns      map[string][]string          // column names per table
@@ -64,21 +63,12 @@ func WithDebugIssues(debug bool) BulkUpsertWriterOption {
 	return func(w *BulkUpsertWriter) { w.debugIssues = debug }
 }
 
-// WithDumpFailedChunks dumps BulkUpsert chunk data to dir when BulkUpsert fails (-ydb-dump-failed-chunks).
+// WithDumpFailedChunks dumps BulkUpsert chunk data to dir when BulkUpsert emits YQL issues (-ydb-dump-failed-chunks).
 func WithDumpFailedChunks(dir string) BulkUpsertWriterOption {
-	return func(w *BulkUpsertWriter) { w.dumpOnErrorDir = dir }
+	return func(w *BulkUpsertWriter) { w.dumpOnIssuesDir = dir }
 }
 
-// WithBulkUpsertNonIdempotent disables SDK retries for BulkUpsert via table.WithIdempotent(false).
-func WithBulkUpsertNonIdempotent(nonIdempotent bool) BulkUpsertWriterOption {
-	return func(w *BulkUpsertWriter) { w.bulkUpsertNonIdempotent = nonIdempotent }
-}
-
-func (w *BulkUpsertWriter) bulkUpsertOpts() []table.Option {
-	return []table.Option{table.WithIdempotent(!w.bulkUpsertNonIdempotent)}
-}
-
-// NewBulkUpsertWriter creates a writer that calls BulkUpsert (table.WithIdempotent() by default).
+// NewBulkUpsertWriter creates a writer that calls BulkUpsert with table.WithIdempotent().
 func NewBulkUpsertWriter(db Client, database string, opts ...BulkUpsertWriterOption) *BulkUpsertWriter {
 	w := &BulkUpsertWriter{
 		db:              db,
@@ -152,7 +142,11 @@ func (w *BulkUpsertWriter) WriteChunk(ctx context.Context, meta *schema.TableMet
 		ydbRows = append(ydbRows, types.StructValue(fields...))
 	}
 	list := types.ListValue(ydbRows...)
-	err = w.db.Table().BulkUpsert(ctx, tablePath, table.BulkUpsertDataRows(list), w.bulkUpsertOpts()...)
+	bulkCtx := ctx
+	if w.dumpOnIssuesDir != "" {
+		bulkCtx = WithBulkUpsertDumpContext(ctx, meta, tablePath, rows)
+	}
+	err = w.db.Table().BulkUpsert(bulkCtx, tablePath, table.BulkUpsertDataRows(list), table.WithIdempotent())
 	if err == nil {
 		return len(rows), nil
 	}
@@ -164,13 +158,6 @@ func (w *BulkUpsertWriter) WriteChunk(ctx context.Context, meta *schema.TableMet
 		w.mu.Unlock()
 		log.Printf("  [ydb] %s: BulkUpsert not supported (sync indexes), using tx upsert for this table", meta.Name)
 		return w.writeChunkTx(ctx, meta, rows, tablePath)
-	}
-	if w.dumpOnErrorDir != "" {
-		if dumpPath, dumpErr := DumpBulkUpsertFailure(w.dumpOnErrorDir, tablePath, meta, rows, err); dumpErr != nil {
-			log.Printf("  [ydb] %s: failed to dump BulkUpsert chunk: %v", meta.Name, dumpErr)
-		} else {
-			log.Printf("  [ydb] %s: dumped failed BulkUpsert chunk (%d rows) to %s", meta.Name, len(rows), dumpPath)
-		}
 	}
 	return 0, err
 }

@@ -87,22 +87,39 @@ func IssuesHandler() query.ExecuteOption {
 	})
 }
 
+// IssueLoggingDriverOpts configures IssueLoggingDriver.
+type IssueLoggingDriverOpts struct {
+	LogIssues bool   // log YQL issues from unary operations (-ydb-debug)
+	DumpDir   string // dump BulkUpsert chunks when issues appear (-ydb-dump-failed-chunks)
+}
+
 // IssueLoggingDriver returns a ydb Option that logs YQL/operation issues carried by unary operation
-// calls (Table service: BulkUpsert, DescribeTable, etc.) under -ydb-debug. This is the only way to
-// surface issues from BulkUpsert: that API returns no result object, so there is no per-call issues
-// callback (unlike the query service's WithIssuesHandler).
+// calls (Table service: BulkUpsert, DescribeTable, etc.). This is the only way to surface issues from
+// BulkUpsert: that API returns no result object, so there is no per-call issues callback (unlike the
+// query service's WithIssuesHandler).
 //
 // It logs on both success AND failure of every invoke. This matters because BulkUpsert (and other
 // idempotent ops) retry on errors: each attempt is a separate invoke, and the informative YQL issues
 // often live in intermediate failed attempts, while the final error returned to the caller may be a
 // context/timeout error that carries no issues at all — so LogIssuesIfDebug on the returned error
 // would miss them.
-func IssueLoggingDriver() ydbsdk.Option {
+//
+// When DumpDir is set, BulkUpsert chunks with attached BulkUpsertDumpContext are dumped once on the
+// first invoke that carries issues (including intermediate retries).
+func IssueLoggingDriver(opts IssueLoggingDriverOpts) ydbsdk.Option {
 	return ydbsdk.WithTraceDriver(ydbtrace.Driver{
-		OnConnInvoke: func(ydbtrace.DriverConnInvokeStartInfo) func(ydbtrace.DriverConnInvokeDoneInfo) {
+		OnConnInvoke: func(start ydbtrace.DriverConnInvokeStartInfo) func(ydbtrace.DriverConnInvokeDoneInfo) {
+			method := string(start.Method)
 			return func(info ydbtrace.DriverConnInvokeDoneInfo) {
-				if s := traceIssuesString(info.Issues); s != "" {
-					log.Printf("YDB YQL issues (from operation):\n%s", s)
+				issuesStr := traceIssuesString(info.Issues)
+				if issuesStr == "" {
+					return
+				}
+				if opts.LogIssues {
+					log.Printf("YDB YQL issues (from operation):\n%s", issuesStr)
+				}
+				if opts.DumpDir != "" && isBulkUpsertDriverMethod(method) && start.Context != nil && *start.Context != nil {
+					tryDumpBulkUpsertOnIssues(*start.Context, opts.DumpDir, issuesStr, info.Error)
 				}
 			}
 		},

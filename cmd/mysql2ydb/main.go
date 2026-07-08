@@ -61,9 +61,6 @@ func main() {
 			ydblog.Default(os.Stdout, ydblog.WithMinLevel(ydblog.DEBUG), ydblog.WithLogQuery()),
 			ydbtrace.DetailsAll,
 		))
-		// Surface YQL issues from successful unary operations (e.g. BulkUpsert), which the
-		// default SDK logger does not print and which have no per-call issues callback.
-		ydbOpts = append(ydbOpts, ydb.IssueLoggingDriver())
 		log.Println("YDB SDK trace logging enabled (-ydb-debug)")
 	} else if cfg.YDBWarn {
 		ydbOpts = append(ydbOpts, ydbsdk.WithLogger(
@@ -71,6 +68,14 @@ func main() {
 			ydbtrace.DetailsAll,
 		))
 		log.Println("YDB SDK WARN+ logging enabled (-ydb-warn)")
+	}
+	if cfg.YDBDebug || cfg.YDBDumpFailedChunks != "" {
+		// Surface YQL issues from unary operations (e.g. BulkUpsert), which the default SDK logger
+		// does not print and which have no per-call issues callback. Optionally dump chunks on issues.
+		ydbOpts = append(ydbOpts, ydb.IssueLoggingDriver(ydb.IssueLoggingDriverOpts{
+			LogIssues: cfg.YDBDebug,
+			DumpDir:   cfg.YDBDumpFailedChunks,
+		}))
 	}
 	ydbdb, err := ydb.Open(ctx, cfg, ydbOpts...)
 	if err != nil {
@@ -184,18 +189,14 @@ func main() {
 	}
 	if cfg.YDBDumpFailedChunks != "" {
 		writerOpts = append(writerOpts, ydb.WithDumpFailedChunks(cfg.YDBDumpFailedChunks))
-		log.Printf("BulkUpsert failure dumps enabled (-ydb-dump-failed-chunks=%s)", cfg.YDBDumpFailedChunks)
-	}
-	if cfg.YDBBulkUpsertNonIdempotent {
-		writerOpts = append(writerOpts, ydb.WithBulkUpsertNonIdempotent(true))
-		log.Println("BulkUpsert SDK retries disabled (-ydb-bulkupsert-non-idempotent)")
+		log.Printf("BulkUpsert issue dumps enabled (-ydb-dump-failed-chunks=%s)", cfg.YDBDumpFailedChunks)
 	}
 	writer := ydb.NewBulkUpsertWriter(ydbdb, dbPath, writerOpts...)
 	freeRAM := memory.FreeBytes()
 	if freeRAM > 0 {
 		log.Printf("Available RAM for chunks: %.1f GiB", float64(freeRAM)/(1<<30))
 	}
-	log.Println("Transferring data (chunked BulkUpsert)...")
+	log.Println("Transferring data (chunked BulkUpsert, idempotent)...")
 	prog := progress.NewDisplay(pending)
 	prog.ReserveLines()
 	progressCtx, progressCancel := context.WithCancel(ctx)

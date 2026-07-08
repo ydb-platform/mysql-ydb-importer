@@ -39,16 +39,6 @@ func TestMysqlValueToYDB(t *testing.T) {
 	}
 }
 
-func TestBulkUpsertOpts(t *testing.T) {
-	w := &BulkUpsertWriter{}
-	if len(w.bulkUpsertOpts()) != 1 {
-		t.Fatalf("expected one table option, got %d", len(w.bulkUpsertOpts()))
-	}
-	w.bulkUpsertNonIdempotent = true
-	if len(w.bulkUpsertOpts()) != 1 {
-		t.Fatalf("expected one table option for non-idempotent mode, got %d", len(w.bulkUpsertOpts()))
-	}
-}
 func TestYdbTypeFromMySQL(t *testing.T) {
 	if types.TypeInt64 != ydbTypeFromMySQL("bigint") {
 		t.Error("bigint should map to TypeInt64")

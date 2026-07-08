@@ -1,6 +1,7 @@
 package ydb
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -14,11 +15,11 @@ import (
 
 func TestSanitizeDumpFileComponent(t *testing.T) {
 	cases := map[string]string{
-		"users":       "users",
-		"my/table":    "my_table",
-		"  spaced  ":  "spaced",
-		"":            "table",
-		"foo-bar_1":   "foo-bar_1",
+		"users":      "users",
+		"my/table":   "my_table",
+		"  spaced  ": "spaced",
+		"":           "table",
+		"foo-bar_1":  "foo-bar_1",
 	}
 	for in, want := range cases {
 		if got := sanitizeDumpFileComponent(in); got != want {
@@ -27,7 +28,16 @@ func TestSanitizeDumpFileComponent(t *testing.T) {
 	}
 }
 
-func TestDumpBulkUpsertFailure(t *testing.T) {
+func TestIsBulkUpsertDriverMethod(t *testing.T) {
+	if !isBulkUpsertDriverMethod("/Ydb.Table.V1.TableService/BulkUpsert") {
+		t.Fatal("expected BulkUpsert grpc method to match")
+	}
+	if isBulkUpsertDriverMethod("/Ydb.Table.V1.TableService/DescribeTable") {
+		t.Fatal("DescribeTable must not match")
+	}
+}
+
+func TestDumpBulkUpsertChunk(t *testing.T) {
 	dir := t.TempDir()
 	meta := &schema.TableMeta{
 		Name: "orders",
@@ -40,13 +50,13 @@ func TestDumpBulkUpsertFailure(t *testing.T) {
 		{"id": int64(1), "note": "hello"},
 		{"id": int64(2), "note": []byte("binary")},
 	}
-	dumpErr := errors.New("BulkUpsert failed: BAD_REQUEST")
+	issues := "  [ERROR] (code=0) Bulk upsert to table '/local/orders' Failed to connect to shard"
 
-	path, err := DumpBulkUpsertFailure(dir, "/local/orders", meta, rows, dumpErr)
+	path, err := DumpBulkUpsertChunk(dir, "/local/orders", meta, rows, errors.New("transport"), issues)
 	if err != nil {
-		t.Fatalf("DumpBulkUpsertFailure: %v", err)
+		t.Fatalf("DumpBulkUpsertChunk: %v", err)
 	}
-	if !strings.HasPrefix(filepath.Base(path), "bulkupsert-failure-orders-") {
+	if !strings.HasPrefix(filepath.Base(path), "bulkupsert-issues-orders-") {
 		t.Fatalf("unexpected dump file name: %s", filepath.Base(path))
 	}
 	data, err := os.ReadFile(path)
@@ -60,8 +70,8 @@ func TestDumpBulkUpsertFailure(t *testing.T) {
 	if got.Table != "orders" || got.TablePath != "/local/orders" || got.RowCount != 2 {
 		t.Fatalf("unexpected dump metadata: %+v", got)
 	}
-	if got.Error != dumpErr.Error() {
-		t.Fatalf("dump error = %q, want %q", got.Error, dumpErr.Error())
+	if got.Issues != issues {
+		t.Fatalf("dump issues = %q, want %q", got.Issues, issues)
 	}
 	if len(got.Columns) != 2 || len(got.Rows) != 2 {
 		t.Fatalf("unexpected columns/rows in dump: columns=%d rows=%d", len(got.Columns), len(got.Rows))
@@ -71,18 +81,37 @@ func TestDumpBulkUpsertFailure(t *testing.T) {
 	}
 }
 
-func TestDumpBulkUpsertFailure_Validation(t *testing.T) {
+func TestTryDumpBulkUpsertOnIssues_OncePerChunk(t *testing.T) {
+	dir := t.TempDir()
+	meta := &schema.TableMeta{Name: "orders", Columns: []schema.Column{{Name: "id", DataType: "bigint"}}}
+	rows := []map[string]interface{}{{"id": int64(1)}}
+	ctx := WithBulkUpsertDumpContext(context.Background(), meta, "/local/orders", rows)
+	issues := "  [ERROR] (code=0) Bulk upsert failed"
+
+	tryDumpBulkUpsertOnIssues(ctx, dir, issues, errors.New("fail"))
+	tryDumpBulkUpsertOnIssues(ctx, dir, issues, errors.New("fail again"))
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dump dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one dump file, got %d", len(entries))
+	}
+}
+
+func TestDumpBulkUpsertChunk_Validation(t *testing.T) {
 	meta := &schema.TableMeta{Name: "t"}
 	rows := []map[string]interface{}{{"id": 1}}
-	err := errors.New("fail")
+	issues := "  [ERROR] (code=0) issue"
 
-	if _, err := DumpBulkUpsertFailure("", "/t", meta, rows, err); err == nil {
+	if _, err := DumpBulkUpsertChunk("", "/t", meta, rows, nil, issues); err == nil {
 		t.Fatal("expected error for empty dir")
 	}
-	if _, err := DumpBulkUpsertFailure(t.TempDir(), "/t", nil, rows, err); err == nil {
+	if _, err := DumpBulkUpsertChunk(t.TempDir(), "/t", nil, rows, nil, issues); err == nil {
 		t.Fatal("expected error for nil meta")
 	}
-	if _, err := DumpBulkUpsertFailure(t.TempDir(), "/t", meta, rows, nil); err == nil {
-		t.Fatal("expected error for nil err")
+	if _, err := DumpBulkUpsertChunk(t.TempDir(), "/t", meta, rows, nil, ""); err == nil {
+		t.Fatal("expected error for empty issues and nil err")
 	}
 }

@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/go-sql-driver/mysql v1.9.3
-	github.com/ydb-platform/ydb-go-sdk/v3 v3.142.0
+	github.com/ydb-platform/ydb-go-sdk/v3 v3.126.4
 	github.com/ydb-platform/ydb-go-yc v0.12.4
 	golang.org/x/sync v0.19.0
 )
