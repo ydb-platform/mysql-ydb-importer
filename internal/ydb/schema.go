@@ -3,7 +3,6 @@ package ydb
 import (
 	"context"
 	"fmt"
-	"log"
 	"path"
 	"strings"
 
@@ -23,15 +22,14 @@ func (f QueryExecFunc) Exec(ctx context.Context, query string) error { return f(
 // DropTable drops a table in YDB via Query service (DROP TABLE IF EXISTS). Idempotent.
 func DropTable(ctx context.Context, q QueryExecer, database string, tableName string) error {
 	tablePath := path.Join(database, tableName)
-	quotedPath := quoteYQLPath(tablePath)
+	quotedPath := "`" + strings.ReplaceAll(tablePath, "`", "``") + "`"
 	return q.Exec(ctx, "DROP TABLE IF EXISTS "+quotedPath)
 }
 
 // CreateTable creates a table in YDB via Query service (CREATE TABLE ... WITH AUTO_PARTITIONING_BY_LOAD = ENABLED).
-// When includeIndexes is false, only columns and PRIMARY KEY are created; secondary indexes are added later via CreateSecondaryIndexes.
-func CreateTable(ctx context.Context, q QueryExecer, database string, meta *schema.TableMeta, includeIndexes bool) error {
+func CreateTable(ctx context.Context, q QueryExecer, database string, meta *schema.TableMeta) error {
 	tablePath := path.Join(database, meta.Name)
-	if err := q.Exec(ctx, buildCreateTableDDL(tablePath, meta, includeIndexes)); err != nil {
+	if err := q.Exec(ctx, buildCreateTableDDL(tablePath, meta)); err != nil {
 		return err
 	}
 	if meta.AutoIncrementNext > 0 {
@@ -40,48 +38,18 @@ func CreateTable(ctx context.Context, q QueryExecer, database string, meta *sche
 	return nil
 }
 
-// CreateSecondaryIndexes adds secondary indexes from MySQL metadata via ALTER TABLE ADD INDEX.
-// Skips indexes that duplicate the primary key. No-op when there are no secondary indexes.
-func CreateSecondaryIndexes(ctx context.Context, q QueryExecer, database string, meta *schema.TableMeta) error {
-	tablePath := path.Join(database, meta.Name)
-	indexes := SecondaryIndexes(meta)
-	if len(indexes) == 0 {
-		return nil
-	}
-	for _, idx := range indexes {
-		ddl := buildAddIndexDDL(tablePath, idx)
-		log.Printf("  [ydb] %s: %s", meta.Name, strings.TrimSpace(ddl))
-		if err := q.Exec(ctx, ddl); err != nil {
-			return fmt.Errorf("add index %s on %s: %w", idx.Name, meta.Name, err)
-		}
-	}
-	return nil
-}
-
-// SecondaryIndexes returns MySQL secondary indexes that should be created in YDB (excludes PK duplicates).
-func SecondaryIndexes(meta *schema.TableMeta) []schema.IndexInfo {
-	var out []schema.IndexInfo
-	for _, idx := range meta.Indexes {
-		if indexEqualsPK(idx.Columns, meta.PKCols) {
-			continue
-		}
-		out = append(out, idx)
-	}
-	return out
-}
-
 // AlterSequence sets the next value for a table's serial column (YDB sequence).
 // Path format as in mysql-to-ydb-converter: <database>/<table>/_serial_column_id.
 func AlterSequence(ctx context.Context, q QueryExecer, database string, tableName string, startWith uint64) error {
 	seqPath := path.Join(database, tableName, "_serial_column_id")
-	quotedPath := quoteYQLPath(seqPath)
+	quotedPath := "`" + strings.ReplaceAll(seqPath, "`", "``") + "`"
 	return q.Exec(ctx, fmt.Sprintf("ALTER SEQUENCE %s START WITH %d RESTART", quotedPath, startWith))
 }
 
 // buildCreateTableDDL returns YQL CREATE TABLE statement with optional columns and AUTO_PARTITIONING_BY_LOAD.
 // AUTO_INCREMENT columns from MySQL become BigSerial NOT NULL in YDB (sequence per table).
-func buildCreateTableDDL(tablePath string, meta *schema.TableMeta, includeIndexes bool) string {
-	quotedPath := quoteYQLPath(tablePath)
+func buildCreateTableDDL(tablePath string, meta *schema.TableMeta) string {
+	quotedPath := "`" + strings.ReplaceAll(tablePath, "`", "``") + "`"
 	var parts []string
 	for _, col := range meta.Columns {
 		var line string
@@ -93,10 +61,17 @@ func buildCreateTableDDL(tablePath string, meta *schema.TableMeta, includeIndexe
 		}
 		parts = append(parts, line)
 	}
-	if includeIndexes {
-		for _, idx := range SecondaryIndexes(meta) {
-			parts = append(parts, buildInlineIndexDef(idx))
+	// Secondary indexes: GLOBAL ASYNC for non-unique, GLOBAL UNIQUE SYNC for unique (skip duplicate of PK)
+	for _, idx := range meta.Indexes {
+		if indexEqualsPK(idx.Columns, meta.PKCols) {
+			continue
 		}
+		quotedCols := make([]string, len(idx.Columns))
+		for i, c := range idx.Columns {
+			quotedCols[i] = quoteYQLName(c)
+		}
+		indexLine := fmt.Sprintf("INDEX %s GLOBAL %s ON (%s)", quoteYQLName(idx.Name), indexKind(idx.Unique), strings.Join(quotedCols, ", "))
+		parts = append(parts, indexLine)
 	}
 	pkList := make([]string, len(meta.PKCols))
 	for i, pk := range meta.PKCols {
@@ -105,27 +80,6 @@ func buildCreateTableDDL(tablePath string, meta *schema.TableMeta, includeIndexe
 	parts = append(parts, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(pkList, ", ")))
 	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n\t%s\n)\nWITH (\n\tAUTO_PARTITIONING_BY_LOAD = ENABLED\n)",
 		quotedPath, strings.Join(parts, ",\n\t"))
-}
-
-func buildInlineIndexDef(idx schema.IndexInfo) string {
-	quotedCols := make([]string, len(idx.Columns))
-	for i, c := range idx.Columns {
-		quotedCols[i] = quoteYQLName(c)
-	}
-	return fmt.Sprintf("INDEX %s GLOBAL %s ON (%s)", quoteYQLName(idx.Name), indexKind(idx.Unique), strings.Join(quotedCols, ", "))
-}
-
-func buildAddIndexDDL(tablePath string, idx schema.IndexInfo) string {
-	quotedCols := make([]string, len(idx.Columns))
-	for i, c := range idx.Columns {
-		quotedCols[i] = quoteYQLName(c)
-	}
-	return fmt.Sprintf("ALTER TABLE %s ADD INDEX %s GLOBAL %s ON (%s);",
-		quoteYQLPath(tablePath), quoteYQLName(idx.Name), indexKind(idx.Unique), strings.Join(quotedCols, ", "))
-}
-
-func quoteYQLPath(p string) string {
-	return "`" + strings.ReplaceAll(p, "`", "``") + "`"
 }
 
 func quoteYQLName(name string) string {
