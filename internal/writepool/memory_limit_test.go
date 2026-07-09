@@ -7,8 +7,8 @@ func TestMaxLimitForMemory(t *testing.T) {
 		t.Fatalf("no meminfo: got %d want 8", got)
 	}
 	got := MaxLimitForMemory(8<<30, 1, 10_000, 256)
-	if got < 32 || got > maxLimitCeil {
-		t.Fatalf("large RAM: got %d want in [32, %d]", got, maxLimitCeil)
+	if got != maxLimitCeil {
+		t.Fatalf("large RAM: got %d want %d", got, maxLimitCeil)
 	}
 	got = MaxLimitForMemory(512<<20, 4, 10_000, 1024)
 	if got < maxLimitFloor || got > maxLimitCeil {

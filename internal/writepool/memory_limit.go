@@ -2,7 +2,7 @@ package writepool
 
 const (
 	maxLimitFloor        = 1
-	maxLimitCeil         = 1000
+	maxLimitCeil         = 32
 	chunkChannelBuf      = 4
 	chunkMemoryOverhead  = 3
 	writePoolRAMFraction = 0.4

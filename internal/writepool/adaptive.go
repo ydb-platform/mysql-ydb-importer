@@ -44,7 +44,7 @@ type sample struct {
 // PoolOption configures an AdaptivePool.
 type PoolOption func(*AdaptivePool)
 
-// WithMaxLimit sets the upper bound on concurrent writes (default 1000).
+// WithMaxLimit sets the upper bound on concurrent writes (default 32).
 func WithMaxLimit(n int) PoolOption {
 	return func(p *AdaptivePool) {
 		if n > 0 {
