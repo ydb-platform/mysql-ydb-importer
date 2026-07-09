@@ -1,0 +1,19 @@
+name: mysql2ydb
+arch: amd64
+platform: linux
+version: "${VERSION}"
+version_schema: none
+section: database
+priority: optional
+maintainer: YDB Platform
+description: |
+  Efficient utility for migrating schema and data from MySQL to YDB.
+  Designed for large tables with bounded memory usage.
+homepage: https://github.com/ydb-platform/mysql-ydb-importer
+license: Apache-2.0
+
+contents:
+  - src: dist/mysql2ydb
+    dst: /usr/bin/mysql2ydb
+    file_info:
+      mode: 0755

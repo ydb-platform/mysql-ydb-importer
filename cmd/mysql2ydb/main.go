@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mysql2ydb/mysql2ydb/internal/config"
@@ -15,6 +17,8 @@ import (
 	"github.com/mysql2ydb/mysql2ydb/internal/mysql"
 	"github.com/mysql2ydb/mysql2ydb/internal/progress"
 	"github.com/mysql2ydb/mysql2ydb/internal/schema"
+	"github.com/mysql2ydb/mysql2ydb/internal/shutdown"
+	"github.com/mysql2ydb/mysql2ydb/internal/writepool"
 	"github.com/mysql2ydb/mysql2ydb/internal/ydb"
 	ydbsdk "github.com/ydb-platform/ydb-go-sdk/v3"
 	ydblog "github.com/ydb-platform/ydb-go-sdk/v3/log"
@@ -45,15 +49,23 @@ func main() {
 		log.Fatalf("mysql: %v", err)
 	}
 	defer func() { _ = mysqldb.Close() }()
-	// Allow concurrent reads when transferring multiple tables in parallel.
+	// One MySQL reader per table; pool size follows table parallelism, not YDB write slots.
+	mysqlConns := 8
 	if cfg.ParallelTables > 1 {
-		n := cfg.ParallelTables * 2
-		if n < 8 {
-			n = 8
+		mysqlConns = cfg.ParallelTables * 2
+		if mysqlConns < 8 {
+			mysqlConns = 8
 		}
-		mysqldb.SetMaxOpenConns(n)
-		mysqldb.SetMaxIdleConns(cfg.ParallelTables)
 	}
+	mysqldb.SetMaxOpenConns(mysqlConns)
+	idle := cfg.ParallelTables
+	if idle < 4 {
+		idle = 4
+	}
+	mysqldb.SetMaxIdleConns(idle)
+	// Drop idle connections before MySQL wait_timeout; parallel tables leave pool connections idle longer between chunk reads.
+	mysqldb.SetConnMaxLifetime(5 * time.Minute)
+	mysqldb.SetConnMaxIdleTime(90 * time.Second)
 
 	ydbOpts := []ydbsdk.Option{}
 	if cfg.YDBDebug {
@@ -68,6 +80,14 @@ func main() {
 			ydbtrace.DetailsAll,
 		))
 		log.Println("YDB SDK WARN+ logging enabled (-ydb-warn)")
+	}
+	if cfg.YDBDebug || cfg.YDBDumpFailedChunks != "" {
+		// Surface YQL issues from unary operations (e.g. BulkUpsert), which the default SDK logger
+		// does not print and which have no per-call issues callback. Optionally dump chunks on issues.
+		ydbOpts = append(ydbOpts, ydb.IssueLoggingDriver(ydb.IssueLoggingDriverOpts{
+			LogIssues: cfg.YDBDebug,
+			DumpDir:   cfg.YDBDumpFailedChunks,
+		}))
 	}
 	ydbdb, err := ydb.Open(ctx, cfg, ydbOpts...)
 	if err != nil {
@@ -179,18 +199,36 @@ func main() {
 		writerOpts = append(writerOpts, ydb.WithForceTxUpsert(true))
 		log.Println("Using transactional UPSERT (-ydb-force-tx-upsert)")
 	}
+	if cfg.YDBDumpFailedChunks != "" {
+		writerOpts = append(writerOpts, ydb.WithDumpFailedChunks(cfg.YDBDumpFailedChunks))
+		log.Printf("BulkUpsert issue dumps enabled (-ydb-dump-failed-chunks=%s)", cfg.YDBDumpFailedChunks)
+	}
 	writer := ydb.NewBulkUpsertWriter(ydbdb, dbPath, writerOpts...)
 	freeRAM := memory.FreeBytes()
 	if freeRAM > 0 {
 		log.Printf("Available RAM for chunks: %.1f GiB", float64(freeRAM)/(1<<30))
 	}
-	log.Println("Transferring data (chunked BulkUpsert, idempotent)...")
+	log.Println("Transferring data (chunked BulkUpsert, idempotent, adaptive parallel writes)...")
+	transferCtx, stopSignals := shutdown.NotifyContext(ctx)
+	defer stopSignals()
+
+	writeReserve := writepool.MemoryReserve(freeRAM)
+	writeMax := writepool.MaxLimitForMemory(freeRAM, cfg.ParallelTables, cfg.BatchSize, 256)
+	writePool := writepool.NewAdaptivePool(
+		writepool.WithMaxLimit(writeMax),
+		writepool.WithMemoryReserve(writeReserve),
+	)
+	log.Printf("Write pool: max concurrency %d, RAM reserve %.1f GiB (-parallel-tables=%d)",
+		writeMax, float64(writeReserve)/(1<<30), cfg.ParallelTables)
+	defer writePool.Close()
+
 	prog := progress.NewDisplay(pending)
 	prog.ReserveLines()
-	progressCtx, progressCancel := context.WithCancel(ctx)
+	progressCtx, progressCancel := context.WithCancel(transferCtx)
 	defer progressCancel()
 	go prog.Run(progressCtx)
 
+	var transferErr error
 	transferTable := func(ctx context.Context, name string) error {
 		meta, err := schema.LoadTableMeta(mysqldb, name)
 		if err != nil {
@@ -201,21 +239,32 @@ func main() {
 			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 			return fmt.Errorf("progress %s: %w", name, err)
 		}
-		batchSize := batchSizeForTable(cfg.BatchSize, cfg.MaxChunkRows, freeRAM, mysqldb, name)
+		batchSize := batchSizeForTable(cfg.BatchSize, cfg.MaxChunkRows, freeRAM, cfg.ParallelTables, mysqldb, name)
 		reader := mysql.NewChunkReader(mysqldb, meta, batchSize)
 		type chunkMsg struct {
 			rows []map[string]interface{}
 			next []interface{}
 		}
-		ch := make(chan chunkMsg, 2)
-		totalCh := make(chan int, 1)
+		ch := make(chan chunkMsg, writepool.ChunkChannelBuf())
+		var rowsSoFar atomic.Int64
+		rowsSoFar.Store(int64(initialTotal))
+		tracker := writepool.NewOrderedTracker(initialTotal, func(saveCtx context.Context, nextCursor []interface{}, total int) error {
+			rowsSoFar.Store(int64(total))
+			prog.Update(name, total)
+			if err := ydb.SaveProgressFlushing(saveCtx, ydbdb, dbPath, name, nextCursor, total); err != nil {
+				ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
+				return fmt.Errorf("save progress to %s: %w", ydb.StateTablePath(dbPath), err)
+			}
+			return nil
+		})
 		g, gCtx := errgroup.WithContext(ctx)
 		g.Go(func() error {
+			defer close(ch)
 			cursor := initialCursor
 			for {
 				rows, next, hasMore, err := reader.ReadChunk(gCtx, cursor)
 				if err != nil {
-					return err
+					return fmt.Errorf("mysql read: %w", err)
 				}
 				if len(rows) > 0 {
 					var nextSend []interface{}
@@ -233,30 +282,36 @@ func main() {
 				}
 				cursor = next
 			}
-			close(ch)
 			return nil
 		})
 		g.Go(func() error {
-			total := initialTotal
+			writeG, writeCtx := errgroup.WithContext(gCtx)
+			chunkIdx := 0
 			for msg := range ch {
-				written, err := writer.WriteChunk(gCtx, meta, msg.rows)
-				if err != nil {
+				msg := msg
+				idx := chunkIdx
+				chunkIdx++
+				if err := writePool.Acquire(writeCtx); err != nil {
 					return err
 				}
-				total += written
-				prog.Update(name, total)
-				if err := ydb.SaveProgress(gCtx, ydbdb, dbPath, name, msg.next, total); err != nil {
-					ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
-					return fmt.Errorf("save progress to %s: %w", ydb.StateTablePath(dbPath), err)
-				}
+				writeG.Go(func() error {
+					defer writePool.Release(len(msg.rows))
+					written, err := writer.WriteChunk(writeCtx, meta, msg.rows)
+					if err != nil {
+						return fmt.Errorf("ydb write: %w", err)
+					}
+					if err := tracker.Complete(writeCtx, idx, msg.next, written); err != nil {
+						return fmt.Errorf("progress: %w", err)
+					}
+					return nil
+				})
 			}
-			totalCh <- total
-			return nil
+			return writeG.Wait()
 		})
 		if err := g.Wait(); err != nil {
-			return err
+			return fmt.Errorf("table %s: %w", name, err)
 		}
-		total := <-totalCh
+		total := int(rowsSoFar.Load())
 		if err := ydb.MarkTableCompleted(ctx, ydbdb, dbPath, name, total); err != nil {
 			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
 			return fmt.Errorf("mark %s completed: %w", name, err)
@@ -267,25 +322,30 @@ func main() {
 
 	if cfg.ParallelTables <= 1 {
 		for _, name := range pending {
-			if err := transferTable(ctx, name); err != nil {
-				prog.Stop()
-				fatalYDB(cfg, err, "  %v", err)
+			if err := transferTable(transferCtx, name); err != nil {
+				transferErr = err
+				break
 			}
 		}
 	} else {
-		g := new(errgroup.Group)
+		g, gCtx := errgroup.WithContext(transferCtx)
+		g.SetLimit(cfg.ParallelTables)
 		for _, name := range pending {
 			name := name
 			g.Go(func() error {
-				return transferTable(ctx, name)
+				return transferTable(gCtx, name)
 			})
 		}
-		if err := g.Wait(); err != nil {
-			prog.Stop()
-			fatalYDB(cfg, err, "transfer: %v", err)
-		}
+		transferErr = g.Wait()
 	}
 	prog.Stop()
+	if transferErr != nil {
+		if shutdown.IsInterrupt(transferErr) {
+			shutdown.LogInterrupt()
+			os.Exit(130)
+		}
+		fatalYDB(cfg, transferErr, "transfer: %v", transferErr)
+	}
 	log.Println("Done.")
 }
 
@@ -311,10 +371,13 @@ func openMySQL(dsn string) (*sql.DB, error) {
 // - one chunk fits in a fraction of available RAM;
 // - one chunk is downloaded from MySQL in ≤10s at 100 Mbit/s (125 MB);
 // - never exceeds maxChunkRows.
-func batchSizeForTable(configBatch, maxChunkRows int, freeRAM uint64, db *sql.DB, tableName string) int {
+func batchSizeForTable(configBatch, maxChunkRows int, freeRAM uint64, parallelTables int, db *sql.DB, tableName string) int {
 	batch := configBatch
 	if maxChunkRows > 0 && batch > maxChunkRows {
 		batch = maxChunkRows
+	}
+	if parallelTables > 1 && freeRAM > 0 {
+		freeRAM /= uint64(parallelTables)
 	}
 	dataLen, rowCount, err := schema.TableSize(db, tableName)
 	var avgRowBytes uint64

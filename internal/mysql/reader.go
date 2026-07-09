@@ -27,6 +27,14 @@ func NewChunkReader(db *sql.DB, meta *schema.TableMeta, batchSize int) *ChunkRea
 // LIMIT/OFFSET. Returns (rows, lastCursor, hasMore, error). lastCursor is used
 // for the next call when using cursor pagination.
 func (r *ChunkReader) ReadChunk(ctx context.Context, cursor []interface{}) (rows []map[string]interface{}, nextCursor []interface{}, hasMore bool, err error) {
+	err = WithConnRetry(ctx, func() error {
+		rows, nextCursor, hasMore, err = r.readChunkOnce(ctx, cursor)
+		return err
+	})
+	return rows, nextCursor, hasMore, err
+}
+
+func (r *ChunkReader) readChunkOnce(ctx context.Context, cursor []interface{}) (rows []map[string]interface{}, nextCursor []interface{}, hasMore bool, err error) {
 	colNames := make([]string, 0, len(r.meta.Columns))
 	for _, c := range r.meta.Columns {
 		colNames = append(colNames, "`"+c.Name+"`")
