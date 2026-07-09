@@ -137,13 +137,18 @@ func main() {
 	}
 	// If state table exists, schema was already created in a previous run — skip all DDL.
 	if !cfg.DataOnly && !stateTableExists {
-		log.Println("Creating schema in YDB...")
+		includeIndexes := cfg.SchemaOnly
+		if includeIndexes {
+			log.Println("Creating schema in YDB (with indexes)...")
+		} else {
+			log.Println("Creating schema in YDB (without secondary indexes; indexes added after data load)...")
+		}
 		for _, name := range tables {
 			meta, err := schema.LoadTableMeta(mysqldb, name)
 			if err != nil {
 				log.Fatalf("schema %s: %v", name, err)
 			}
-			if err := ydb.CreateTable(ctx, queryExec, dbPath, meta); err != nil {
+			if err := ydb.CreateTable(ctx, queryExec, dbPath, meta, includeIndexes); err != nil {
 				fatalYDB(cfg, err, "create table %s: %v", name, err)
 			}
 			log.Printf("  created table %s", name)
@@ -157,6 +162,10 @@ func main() {
 		log.Println("State table exists, skipping DDL.")
 	}
 
+	if err := ydb.UpgradeStateTable(ctx, ydbdb, queryExec, dbPath); err != nil {
+		fatalYDB(cfg, err, "upgrade state table: %v", err)
+	}
+
 	if cfg.SchemaOnly {
 		log.Println("Schema only, done.")
 		os.Exit(0)
@@ -166,7 +175,12 @@ func main() {
 	if err := ydb.CreateStateTable(ctx, queryExec, dbPath); err != nil {
 		fatalYDB(cfg, err, "state table: %v", err)
 	}
+	if err := ydb.UpgradeStateTable(ctx, ydbdb, queryExec, dbPath); err != nil {
+		fatalYDB(cfg, err, "upgrade state table: %v", err)
+	}
 	completedSet := make(map[string]bool)
+	dataCompletedSet := make(map[string]bool)
+	var pendingIndexes []ydb.PendingIndexTable
 	if !cfg.Force {
 		completed, err := ydb.GetCompletedTables(ctx, ydbdb, dbPath, queryIssueOpts(cfg.YDBDebug)...)
 		if err != nil {
@@ -175,19 +189,71 @@ func main() {
 		for _, n := range completed {
 			completedSet[n] = true
 		}
+		pendingIndexes, err = ydb.GetTablesPendingIndexes(ctx, ydbdb, dbPath, queryIssueOpts(cfg.YDBDebug)...)
+		if err != nil {
+			fatalYDB(cfg, err, "read pending indexes: %v", err)
+		}
+		for _, t := range pendingIndexes {
+			dataCompletedSet[t.Name] = true
+		}
 	} else {
 		log.Println("Force mode: re-transfer all tables (ignoring completed state).")
 	}
 	var pending []string
+	var indexPending []ydb.PendingIndexTable
 	for _, n := range tables {
-		if !completedSet[n] {
-			pending = append(pending, n)
-		} else {
+		if completedSet[n] {
 			log.Printf("  %s: skip (already migrated)", n)
+			continue
 		}
+		if dataCompletedSet[n] {
+			continue
+		}
+		pending = append(pending, n)
 	}
-	if len(pending) == 0 {
+	for _, t := range pendingIndexes {
+		if completedSet[t.Name] {
+			continue
+		}
+		indexPending = append(indexPending, t)
+	}
+	if len(pending) == 0 && len(indexPending) == 0 {
 		log.Println("All tables already migrated, nothing to do.")
+		return
+	}
+
+	buildTableIndexes := func(ctx context.Context, name string, rowCount int) error {
+		meta, err := schema.LoadTableMeta(mysqldb, name)
+		if err != nil {
+			return fmt.Errorf("schema %s: %w", name, err)
+		}
+		indexes := ydb.SecondaryIndexes(meta)
+		if len(indexes) > 0 {
+			log.Printf("  %s: building %d secondary index(es)...", name, len(indexes))
+			if err := ydb.CreateSecondaryIndexes(ctx, queryExec, dbPath, meta); err != nil {
+				return fmt.Errorf("indexes %s: %w", name, err)
+			}
+		}
+		if err := ydb.MarkIndexesCompleted(ctx, ydbdb, dbPath, name, rowCount); err != nil {
+			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
+			return fmt.Errorf("mark %s indexes completed: %w", name, err)
+		}
+		log.Printf("  %s: indexes done", name)
+		return nil
+	}
+
+	if len(indexPending) > 0 {
+		log.Printf("Building secondary indexes for %d table(s) with data already loaded...", len(indexPending))
+		for _, t := range indexPending {
+			if err := buildTableIndexes(ctx, t.Name, t.RowsSoFar); err != nil {
+				fatalYDB(cfg, err, "indexes: %v", err)
+			}
+		}
+		indexPending = nil
+	}
+
+	if len(pending) == 0 {
+		log.Println("Done.")
 		return
 	}
 
@@ -312,9 +378,12 @@ func main() {
 			return fmt.Errorf("table %s: %w", name, err)
 		}
 		total := int(rowsSoFar.Load())
-		if err := ydb.MarkTableCompleted(ctx, ydbdb, dbPath, name, total); err != nil {
+		if err := ydb.MarkDataCompleted(ctx, ydbdb, dbPath, name, total); err != nil {
 			ydb.LogIssuesIfDebug(cfg.YDBDebug, err)
-			return fmt.Errorf("mark %s completed: %w", name, err)
+			return fmt.Errorf("mark %s data completed: %w", name, err)
+		}
+		if err := buildTableIndexes(ctx, name, total); err != nil {
+			return err
 		}
 		prog.SetDone(name, total)
 		return nil
