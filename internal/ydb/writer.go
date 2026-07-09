@@ -45,7 +45,8 @@ type BulkUpsertWriter struct {
 	debugIssues     bool // log YQL issues from YDB errors when -ydb-debug is on
 	dumpOnIssuesDir string // dump BulkUpsert chunks when driver trace reports YQL issues (-ydb-dump-failed-chunks)
 	checkedTables   map[string]struct{}
-	txOnlyTables    map[string]struct{}          // tables that require tx path (BulkUpsert not supported), checked once
+	tableInit       map[string]*sync.Once        // one DescribeTable per table under parallel writes
+	txOnlyTables    map[string]struct{}          // tables that require tx path (set after BulkUpsert "async-indexed only" error)
 	ydbColumns      map[string][]string          // column names per table
 	ydbColumnIsText map[string]map[string]bool   // tablePath -> columnName -> true if YDB type is Utf8/Text (not String)
 	ydbColumnYQL    map[string]map[string]string // tablePath -> columnName -> YQL type (e.g. "Uint32", "Optional<Uint32>") for BulkUpsert type coercion
@@ -75,6 +76,7 @@ func NewBulkUpsertWriter(db Client, database string, opts ...BulkUpsertWriterOpt
 		db:              db,
 		database:        database,
 		checkedTables:   make(map[string]struct{}),
+		tableInit:       make(map[string]*sync.Once),
 		txOnlyTables:    make(map[string]struct{}),
 		ydbColumns:      make(map[string][]string),
 		ydbColumnIsText: make(map[string]map[string]bool),
@@ -87,7 +89,7 @@ func NewBulkUpsertWriter(db Client, database string, opts ...BulkUpsertWriterOpt
 }
 
 // WriteChunk sends a batch of rows to YDB via BulkUpsert.
-// If the table has synchronous indexes, falls back to transactional UPSERT (with dedupe by PK/unique).
+// If BulkUpsert fails with "Only async-indexed tables are supported", falls back to transactional UPSERT.
 // Returns the number of rows actually written to YDB (after dedupe in tx path).
 func (w *BulkUpsertWriter) WriteChunk(ctx context.Context, meta *schema.TableMeta, rows []map[string]interface{}) (rowsWritten int, err error) {
 	if len(rows) == 0 {
@@ -182,7 +184,21 @@ func (w *BulkUpsertWriter) checkYDBKeyColumns(ctx context.Context, tablePath str
 		w.mu.Unlock()
 		return nil
 	}
+	once, ok := w.tableInit[tablePath]
+	if !ok {
+		once = &sync.Once{}
+		w.tableInit[tablePath] = once
+	}
 	w.mu.Unlock()
+
+	var initErr error
+	once.Do(func() {
+		initErr = w.loadYDBTableSchema(ctx, tablePath, meta)
+	})
+	return initErr
+}
+
+func (w *BulkUpsertWriter) loadYDBTableSchema(ctx context.Context, tablePath string, meta *schema.TableMeta) error {
 	log.Printf("  [ydb] %s: DescribeTable", meta.Name)
 	ourColsLower := make(map[string]bool)
 	for _, c := range meta.Columns {
@@ -213,14 +229,6 @@ func (w *BulkUpsertWriter) checkYDBKeyColumns(ctx context.Context, tablePath str
 		return fmt.Errorf("YDB table %s has key columns %v that are not in the MySQL table %s. Recreate the YDB table with --schema-only to match MySQL, or add columns %v to MySQL",
 			tablePath, missing, meta.Name, missing)
 	}
-	// BulkUpsert supports only async indexes; sync indexes require transactional UPSERT.
-	hasSyncIndex := false
-	for _, idx := range desc.Indexes {
-		if idx.Type != options.IndexTypeGlobalAsync {
-			hasSyncIndex = true
-			break
-		}
-	}
 	ydbCols := make([]string, 0, len(desc.Columns))
 	colIsText := make(map[string]bool)
 	colYQL := make(map[string]string)
@@ -241,13 +249,7 @@ func (w *BulkUpsertWriter) checkYDBKeyColumns(ctx context.Context, tablePath str
 	w.ydbColumns[tablePath] = ydbCols
 	w.ydbColumnIsText[tablePath] = colIsText
 	w.ydbColumnYQL[tablePath] = colYQL
-	if hasSyncIndex {
-		w.txOnlyTables[tablePath] = struct{}{}
-	}
 	w.mu.Unlock()
-	if hasSyncIndex {
-		log.Printf("  [ydb] %s: table has sync index(es), using tx upsert (BulkUpsert not supported)", meta.Name)
-	}
 	return nil
 }
 
@@ -309,25 +311,12 @@ func (w *BulkUpsertWriter) writeChunkTx(ctx context.Context, meta *schema.TableM
 	for i := range meta.Columns {
 		metaByNameLower[strings.ToLower(meta.Columns[i].Name)] = &meta.Columns[i]
 	}
-	var desc options.Description
-	err = w.db.Table().Do(ctx, func(ctx context.Context, s table.Session) error {
-		var err error
-		desc, err = s.DescribeTable(ctx, tablePath)
-		return err
-	}, table.WithIdempotent())
-	if err != nil {
-		return 0, err
-	}
-	ydbCols := make([]string, 0, len(desc.Columns))
-	colYQL := make(map[string]string)
-	for _, c := range desc.Columns {
-		if metaByNameLower[strings.ToLower(c.Name)] != nil {
-			ydbCols = append(ydbCols, c.Name)
-			colYQL[c.Name] = c.Type.Yql()
-		}
-	}
+	w.mu.Lock()
+	ydbCols := w.ydbColumns[tablePath]
+	colYQL := w.ydbColumnYQL[tablePath]
+	w.mu.Unlock()
 	if len(ydbCols) == 0 {
-		return 0, fmt.Errorf("no matching columns between YDB table %s and MySQL table %s", tablePath, meta.Name)
+		return 0, fmt.Errorf("no matching columns in YDB schema cache for table %s", tablePath)
 	}
 	log.Printf("  [ydb] %s: writeChunkTx start (%d rows)", meta.Name, len(rows))
 	// Parameter types (Optional vs required, Date/Datetime/Timestamp) are carried by the typed
